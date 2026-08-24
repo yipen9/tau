@@ -71,6 +71,8 @@ from tau_coding.events import (
     CompactionStartEvent,
     QueueUpdateEvent,
     SessionAgentEndEvent,
+    SessionInfoChangedEvent,
+    ThinkingLevelChangedEvent,
 )
 from tau_coding.extensions.provider_registry import DynamicProviderRegistry
 from tau_coding.extensions.providers import DynamicProvider, ProviderModel
@@ -131,7 +133,11 @@ from tau_coding.session_export import (
     export_session_artifact,
     normalize_export_format,
 )
-from tau_coding.session_manager import InferenceProviderMode, SessionManager
+from tau_coding.session_manager import (
+    InferenceProviderMode,
+    SessionManager,
+    normalize_session_name,
+)
 from tau_coding.session_stats import SessionStats, calculate_session_stats
 from tau_coding.skills import Skill, expand_skill_command, load_skills_with_diagnostics
 from tau_coding.system_prompt import (
@@ -267,7 +273,7 @@ class SessionResources:
     custom_system_prompt: str | None
     custom_system_prompt_path: Path | None
     append_system_prompt: str | None
-    append_system_prompt_path: Path | None
+    append_system_prompt_paths: tuple[Path, ...]
     diagnostics: tuple[ResourceDiagnostic, ...]
 
 
@@ -379,7 +385,7 @@ class CodingSession:
         custom_system_prompt: str | None = None,
         custom_system_prompt_path: Path | None = None,
         append_system_prompt: str | None = None,
-        append_system_prompt_path: Path | None = None,
+        append_system_prompt_paths: tuple[Path, ...] = (),
         resource_diagnostics: tuple[ResourceDiagnostic, ...] = (),
         command_registry: CommandRegistry | None = None,
         pending_initial_entries: tuple[SessionEntry, ...] = (),
@@ -403,7 +409,7 @@ class CodingSession:
         self._custom_system_prompt = custom_system_prompt
         self._custom_system_prompt_path = custom_system_prompt_path
         self._append_system_prompt = append_system_prompt
-        self._append_system_prompt_path = append_system_prompt_path
+        self._append_system_prompt_paths = append_system_prompt_paths
         self._resource_diagnostics = resource_diagnostics
         self._command_registry = command_registry or create_default_command_registry()
         self._provider_name = config.provider_name
@@ -538,7 +544,6 @@ class CodingSession:
             skills_enabled=config.skills_enabled,
             system_prompt_enabled=config.system is None,
             custom_system_prompt_explicit=config.custom_system_prompt is not None,
-            append_system_prompt_explicit=config.append_system_prompt is not None,
         )
         if summary.categories:
             resources = replace(
@@ -616,13 +621,13 @@ class CodingSession:
                         if config.custom_system_prompt is not None
                         else resources.custom_system_prompt
                     ),
-                    append_system_prompt=(
-                        config.append_system_prompt
-                        if config.append_system_prompt is not None
-                        else resources.append_system_prompt
+                    append_system_prompt=_compose_append_system_prompt(
+                        resources.append_system_prompt,
+                        config.append_system_prompt,
                     ),
                     context_files=resources.context_files,
                     extra_guidelines=extension_runtime.prompt_guidelines,
+                    extra_sections=extension_runtime.prompt_sections,
                 )
             )
         )
@@ -649,7 +654,7 @@ class CodingSession:
             custom_system_prompt=resources.custom_system_prompt,
             custom_system_prompt_path=resources.custom_system_prompt_path,
             append_system_prompt=resources.append_system_prompt,
-            append_system_prompt_path=resources.append_system_prompt_path,
+            append_system_prompt_paths=resources.append_system_prompt_paths,
             resource_diagnostics=resources.diagnostics,
             command_registry=config.command_registry or extension_runtime.build_command_registry(),
             pending_initial_entries=pending_initial_entries,
@@ -1023,6 +1028,16 @@ class CodingSession:
         return self._context_files
 
     @property
+    def system_prompt_files(self) -> tuple[Path, ...]:
+        """Return active discovered system-prompt resource files."""
+        custom_paths = (
+            (self._custom_system_prompt_path,)
+            if self._custom_system_prompt_path is not None
+            else ()
+        )
+        return (*custom_paths, *self._append_system_prompt_paths)
+
+    @property
     def context_token_estimate(self) -> int:
         """Return the best available token count for the active provider context."""
         return self.context_usage.total_tokens
@@ -1245,6 +1260,11 @@ class CodingSession:
         if record is None:
             return None
         return record.title
+
+    @property
+    def session_name(self) -> str | None:
+        """Return this session's indexed human-friendly name, if named."""
+        return self.session_title
 
     @property
     def session_manager(self) -> SessionManager | None:
@@ -1700,6 +1720,7 @@ class CodingSession:
 
         self._persist_thinking_level_choice()
         await self._refresh_persisted_state(leaf_id=entry.id)
+        await self._extension_runtime.emit_event(ThinkingLevelChangedEvent(level=normalized))
         return f"Thinking mode: {normalized}"
 
     async def cycle_thinking_level(self) -> str:
@@ -1991,11 +2012,12 @@ class CodingSession:
             custom_system_prompt=self._custom_system_prompt,
             custom_system_prompt_path=self._custom_system_prompt_path,
             append_system_prompt=self._append_system_prompt,
-            append_system_prompt_path=self._append_system_prompt_path,
+            append_system_prompt_paths=self._append_system_prompt_paths,
         )
         before_extensions = _extension_signatures(self._extension_runtime)
         before_tool_names = tuple(tool.name for tool in self._harness.config.tools)
         before_guidelines = self._extension_runtime.prompt_guidelines
+        before_sections = self._extension_runtime.prompt_sections
 
         # Nothing below mutates the live session. Eligible extensions are loaded
         # first so project code cannot import before the destination decision.
@@ -2052,7 +2074,6 @@ class CodingSession:
             skills_enabled=self._config.skills_enabled,
             system_prompt_enabled=self._config.system is None,
             custom_system_prompt_explicit=self._config.custom_system_prompt is not None,
-            append_system_prompt_explicit=self._config.append_system_prompt is not None,
         )
         if trust_summary is not None and trust_summary.categories:
             assert staged_resolution is not None
@@ -2096,13 +2117,15 @@ class CodingSession:
             custom_system_prompt=resources.custom_system_prompt,
             custom_system_prompt_path=resources.custom_system_prompt_path,
             append_system_prompt=resources.append_system_prompt,
-            append_system_prompt_path=resources.append_system_prompt_path,
+            append_system_prompt_paths=resources.append_system_prompt_paths,
         )
         after_guidelines = staged_runtime.prompt_guidelines
+        after_sections = staged_runtime.prompt_sections
         system_prompt_rebuilt = self._config.system is None and (
             before_system_prompt_inputs != after_system_prompt_inputs
             or before_tool_names != tuple(tool.name for tool in staged_tools)
             or before_guidelines != after_guidelines
+            or before_sections != after_sections
         )
         staged_system = self._harness.config.system
         if system_prompt_rebuilt:
@@ -2116,13 +2139,13 @@ class CodingSession:
                         if self._config.custom_system_prompt is not None
                         else resources.custom_system_prompt
                     ),
-                    append_system_prompt=(
-                        self._config.append_system_prompt
-                        if self._config.append_system_prompt is not None
-                        else resources.append_system_prompt
+                    append_system_prompt=_compose_append_system_prompt(
+                        resources.append_system_prompt,
+                        self._config.append_system_prompt,
                     ),
                     context_files=resources.context_files,
                     extra_guidelines=after_guidelines,
+                    extra_sections=after_sections,
                 )
             )
 
@@ -2156,7 +2179,7 @@ class CodingSession:
         self._custom_system_prompt = resources.custom_system_prompt
         self._custom_system_prompt_path = resources.custom_system_prompt_path
         self._append_system_prompt = resources.append_system_prompt
-        self._append_system_prompt_path = resources.append_system_prompt_path
+        self._append_system_prompt_paths = resources.append_system_prompt_paths
         self._resource_diagnostics = resources.diagnostics
         self._command_registry = staged_commands
         self._extension_runtime = staged_runtime
@@ -2318,17 +2341,53 @@ class CodingSession:
         await self._adopt_replacement(replacement, reason="resume")
         return f"Resumed session: {record.id}"
 
-    def set_session_name(self, name: str) -> None:
-        """Set the indexed session's human-friendly name."""
-        normalized = name.strip()
-        if not normalized:
-            raise ValueError("Session name cannot be empty")
+    async def set_session_name(self, name: str) -> str:
+        """Persist a session name and notify extensions after it changes."""
+        normalized = normalize_session_name(name)
+        persisted = self._persist_session_name(
+            normalized,
+            only_if_unnamed=False,
+            index_if_missing=True,
+        )
+        if persisted is None:
+            return normalized
+        await self._extension_runtime.emit_event(SessionInfoChangedEvent(name=persisted))
+        return persisted
+
+    def _persist_session_name(
+        self,
+        name: str,
+        *,
+        only_if_unnamed: bool,
+        index_if_missing: bool,
+    ) -> str | None:
+        """Persist and return a changed name; return None for a no-op."""
+        normalized = normalize_session_name(name)
         manager = self._config.session_manager
         session_id = self._config.session_id
         if manager is None or session_id is None:
             raise ValueError("Session manager is not available")
-        if manager.touch_session(session_id, title=normalized) is None:
-            raise ValueError(f"Unknown session: {session_id}")
+        record = manager.get_session(session_id)
+        if record is None and index_if_missing:
+            self.ensure_session_indexed()
+            record = manager.get_session(session_id)
+        if record is None:
+            return None
+        if only_if_unnamed and record.title:
+            return None
+        if record.title == normalized:
+            return None
+        updated = manager.touch_session(
+            session_id,
+            model=self.model,
+            provider_name=self.provider_name,
+            title=normalized,
+        )
+        if updated is None:
+            if index_if_missing:
+                raise ValueError(f"Unknown session: {session_id}")
+            return None
+        return updated.title or normalized
 
     async def new_session(self) -> str:
         """Replace this session's active state with a pending unindexed session."""
@@ -2475,7 +2534,7 @@ class CodingSession:
         self._custom_system_prompt = replacement._custom_system_prompt
         self._custom_system_prompt_path = replacement._custom_system_prompt_path
         self._append_system_prompt = replacement._append_system_prompt
-        self._append_system_prompt_path = replacement._append_system_prompt_path
+        self._append_system_prompt_paths = replacement._append_system_prompt_paths
         self._resource_diagnostics = replacement._resource_diagnostics
         self._command_registry = replacement._command_registry
         self._provider_name = replacement._provider_name
@@ -3332,7 +3391,13 @@ class CodingSession:
             title = _fallback_session_name(first_message)
         if title is None:
             return
-        self._set_auto_session_title(title)
+        persisted = self._persist_session_name(
+            title,
+            only_if_unnamed=True,
+            index_if_missing=False,
+        )
+        if persisted is not None:
+            await self._extension_runtime.emit_event(SessionInfoChangedEvent(name=persisted))
 
     def _should_auto_name_session(self) -> bool:
         if self._config.session_id is None or self._config.session_manager is None:
@@ -3365,19 +3430,6 @@ class CodingSession:
                     f"Session naming failed: {event.error.error_message or event.reason}"
                 )
         return _sanitize_session_name(final_text if final_text is not None else "".join(text_parts))
-
-    def _set_auto_session_title(self, title: str) -> None:
-        if self._config.session_id is None or self._config.session_manager is None:
-            return
-        existing = self._config.session_manager.get_session(self._config.session_id)
-        if existing is not None and existing.title:
-            return
-        self._config.session_manager.touch_session(
-            self._config.session_id,
-            model=self.model,
-            provider_name=self.provider_name,
-            title=title,
-        )
 
     def _provider_is_usable(self, provider: ProviderConfig) -> bool:
         return provider_has_usable_credentials(
@@ -4260,7 +4312,7 @@ def _system_prompt_resource_signatures(
     custom_system_prompt: str | None,
     custom_system_prompt_path: Path | None,
     append_system_prompt: str | None,
-    append_system_prompt_path: Path | None,
+    append_system_prompt_paths: tuple[Path, ...],
 ) -> tuple[object, ...]:
     prompt_skills = tuple(
         (skill.name, str(skill.path), skill.description, skill.disable_model_invocation)
@@ -4272,7 +4324,7 @@ def _system_prompt_resource_signatures(
         custom_system_prompt,
         str(custom_system_prompt_path) if custom_system_prompt_path is not None else None,
         append_system_prompt,
-        str(append_system_prompt_path) if append_system_prompt_path is not None else None,
+        tuple(str(path) for path in append_system_prompt_paths),
     )
 
 
@@ -4283,7 +4335,6 @@ def _load_session_resources(
     skills_enabled: bool = True,
     system_prompt_enabled: bool = True,
     custom_system_prompt_explicit: bool = False,
-    append_system_prompt_explicit: bool = False,
 ) -> SessionResources:
     loaded_skills: list[Skill]
     skill_diagnostics: list[ResourceDiagnostic]
@@ -4300,7 +4351,6 @@ def _load_session_resources(
     system_prompts = discover_system_prompt_resources(
         resource_paths,
         custom_prompt_explicit=custom_system_prompt_explicit,
-        append_prompt_explicit=append_system_prompt_explicit,
         enabled=system_prompt_enabled,
     )
     return SessionResources(
@@ -4310,7 +4360,7 @@ def _load_session_resources(
         custom_system_prompt=system_prompts.custom_prompt,
         custom_system_prompt_path=system_prompts.custom_prompt_path,
         append_system_prompt=system_prompts.append_prompt,
-        append_system_prompt_path=system_prompts.append_prompt_path,
+        append_system_prompt_paths=system_prompts.append_prompt_paths,
         diagnostics=tuple(
             [
                 *skill_diagnostics,
@@ -4320,6 +4370,14 @@ def _load_session_resources(
             ]
         ),
     )
+
+
+def _compose_append_system_prompt(*parts: str | None) -> str | None:
+    """Compose discovered and explicit append content in source order."""
+    selected = [part for part in parts if part is not None]
+    if not selected:
+        return None
+    return "\n\n".join(selected)
 
 
 def _merge_context_files(

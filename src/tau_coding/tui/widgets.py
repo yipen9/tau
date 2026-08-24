@@ -23,6 +23,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.content import Content, Span
 from textual.content import Style as TextualStyle  # type: ignore[attr-defined]
 from textual.css.query import NoMatches
 from textual.geometry import Offset
@@ -30,7 +31,7 @@ from textual.selection import Selection
 from textual.widget import Widget
 from textual.widgets import Collapsible, Static
 from textual.widgets import Markdown as TextualMarkdown
-from textual.widgets.markdown import MarkdownBlock, MarkdownStream
+from textual.widgets.markdown import MarkdownBlock, MarkdownFence, MarkdownStream
 
 from tau_agent.tools import AgentTool, ToolCall
 from tau_coding.context_window import estimate_text_tokens
@@ -85,6 +86,9 @@ class SessionSummarySource(Protocol):
 
     @property
     def context_files(self) -> Sequence[ProjectContextFile]: ...
+
+    @property
+    def system_prompt_files(self) -> Sequence[Path]: ...
 
     @property
     def context_token_estimate(self) -> int: ...
@@ -244,6 +248,7 @@ def _session_summary_fingerprint(
         ),
         tuple((template.name, template.path) for template in session.prompt_templates),
         tuple(context.path for context in session.context_files),
+        tuple(session.system_prompt_files),
     )
 
 
@@ -284,10 +289,38 @@ class TauMarkdownBlock(MarkdownBlock):
         return type(content)(content.plain, spans=spans)
 
 
+class TauMarkdownFence(MarkdownFence):
+    """Code fence that discards invalid spans produced by Textual's highlighter."""
+
+    @classmethod
+    def highlight(
+        cls,
+        code: str,
+        language: str,
+        ansi: bool = False,
+        dark: bool = False,
+    ) -> Content:
+        content = super().highlight(code, language, ansi=ansi, dark=dark)
+        text_length = len(content.plain)
+        if all(0 <= span.start < span.end <= text_length for span in content.spans):
+            return content
+        spans = [
+            Span(max(0, span.start), min(text_length, span.end), span.style)
+            for span in content.spans
+            if max(0, span.start) < min(text_length, span.end)
+        ]
+        return Content(content.plain, spans=spans)
+
+
 class ThemedMarkdownWidget(TextualMarkdown):
     """Textual Markdown widget reserved for Tau transcript streaming."""
 
-    BLOCKS = {**TextualMarkdown.BLOCKS, "paragraph_open": TauMarkdownBlock}
+    BLOCKS = {
+        **TextualMarkdown.BLOCKS,
+        "paragraph_open": TauMarkdownBlock,
+        "fence": TauMarkdownFence,
+        "code_block": TauMarkdownFence,
+    }
 
     DEFAULT_CSS = """
     ThemedMarkdownWidget MarkdownH1,
@@ -1845,6 +1878,16 @@ def _build_sidebar_content(
         empty="No context files",
         theme=theme,
     )
+    system_prompt_sections: tuple[RenderableType, ...] = ()
+    if session.system_prompt_files:
+        system_prompt_files = _limited_bullet_list(
+            [_context_file_label(path, cwd=session.cwd) for path in session.system_prompt_files],
+            empty="No system prompt files",
+            theme=theme,
+        )
+        system_prompt_sections = (
+            _sidebar_section("system prompt", system_prompt_files, theme=theme),
+        )
     tools = _comma_list([tool.name for tool in session.tools], empty="No tools", theme=theme)
     return _SidebarContent(
         summary_sections=(
@@ -1853,6 +1896,7 @@ def _build_sidebar_content(
             _sidebar_section("usage", usage, theme=theme),
             _sidebar_section("compaction", compaction, theme=theme),
             _sidebar_section("context", context, theme=theme),
+            *system_prompt_sections,
             _sidebar_section("tools", tools, theme=theme),
         ),
         skills=_grouped_skill_list(session.skills, cwd=session.cwd, theme=theme),

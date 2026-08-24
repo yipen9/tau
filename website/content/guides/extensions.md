@@ -165,6 +165,7 @@ def setup(tau):
     tau.register_provider(dynamic_provider)  # process-local
     tau.register_command("name", handler, description="...")
     tau.add_prompt_guideline("Never commit directly to main")
+    tau.add_prompt_section("Review procedure", "Read the diff, then run tests.")
     tau.on("event_name", handler)            # or @tau.on("event_name")
 
     # message rendering (register in setup; send once running)
@@ -181,7 +182,8 @@ def setup(tau):
     tau.context.cwd, tau.context.model, tau.context.provider_name
     tau.context.inference_provider             # current Hugging Face route, or None
     tau.context.inference_provider_mode        # "automatic" or "fixed"
-    tau.context.session_id, tau.context.system_prompt
+    tau.context.session_id, tau.context.session_name
+    tau.context.thinking_level, tau.context.system_prompt
     tau.context.is_running, tau.context.has_ui
     tau.context.transcript   # parent conversation, deep-copied AgentMessages
 
@@ -327,6 +329,30 @@ something to replace.
 For behavioral guidance not tied to any tool, `add_prompt_guideline(text)`
 adds a line to the system prompt's Guidelines section (de-duplicated at
 build time; `/reload` rebuilds the prompt when guidelines change).
+
+For structured, always-on context, `add_prompt_section(title, body)` appends a
+free-form section after cumulative user and project `APPEND_SYSTEM.md` files and
+`--append-system-prompt` content. The title may be `None`; a title is rendered
+as a level-two Markdown heading. Bodies may contain paragraphs, lists, and code
+blocks without being forced into a guideline bullet:
+
+````python
+def setup(tau):
+    tau.add_prompt_section(
+        "Review procedure",
+        """Read the complete diff before editing.
+
+```bash
+uv run pytest
+```
+""",
+    )
+````
+
+Sections compose in extension load and registration order. Empty bodies and
+multi-line titles are ignored with a resource diagnostic. Registrations are
+source-owned, so failed setup, `/reload`, and generation retirement remove them
+along with the extension's other contributions.
 
 ### Commands
 
@@ -539,8 +565,8 @@ Observation events mirror the canonical agent/session stream. Handlers receive
 | `compaction_start` | `reason` (`manual`, `threshold`, or `overflow`) |
 | `compaction_end` | `reason`, `result`, `aborted`, `will_retry`, `error_message` |
 | `entry_appended` | persisted session `entry` |
-| `session_info_changed` | session `name` |
-| `thinking_level_changed` | `level` |
+| `session_info_changed` | session `name`; emitted after automatic naming or `await session.set_session_name(...)` |
+| `thinking_level_changed` | `level`; emitted after an explicit thinking-mode change |
 | `auto_retry_start` | `attempt`, `max_attempts`, `delay_ms`, `error_message` |
 | `auto_retry_end` | `success`, `attempt`, `final_error` |
 
@@ -549,6 +575,15 @@ stream. Its nested `type` is one of `text_start`, `text_delta`, `text_end`,
 `thinking_start`, `thinking_delta`, `thinking_end`, `toolcall_start`,
 `toolcall_delta`, or `toolcall_end`. Terminal provider events become
 `message_end`, rather than another `message_update`.
+
+`context.session_name` and `context.thinking_level` provide the current values
+when an extension attaches or a replacement session starts. Their matching
+change events carry snapshots of later updates; no-op assignments do not emit.
+Model changes, `/model` and `/local` selections, scoped-model toggles,
+provider reloads, and branch/resume can coerce the active thinking level to
+what the selected model supports without an explicit `thinking_level_changed`
+event, so read the live context when handling other events instead of treating
+change events as a complete cache feed.
 
 Extension turn events are session-enriched like Pi's. `turn_start` and its
 matching `turn_end` carry the same zero-based `turn_index`; `turn_start` also
@@ -713,6 +748,7 @@ See [`examples/extensions/`](https://github.com/huggingface/tau/tree/main/exampl
 - **`permission_gate.py`** — blocks dangerous bash commands with the
   `tool_call` hook.
 - **`sidebar_status.py`** — adds and updates a host-framed sidebar section.
+- **`prompt_section.py`** — appends a labeled multi-line system-prompt section.
 
 A larger, real-world extension lives in its own repository:
 [rian-dolphin/tau-subagents](https://github.com/rian-dolphin/tau-subagents)

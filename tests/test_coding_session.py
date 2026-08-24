@@ -2800,6 +2800,49 @@ async def test_session_auto_name_does_not_overwrite_manual_name(tmp_path: Path) 
 
 
 @pytest.mark.anyio
+async def test_manual_name_wins_while_auto_name_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = WaitingProvider()
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+    metadata_names: list[str | None] = []
+    original_emit = session.extension_runtime.emit_event
+
+    async def record_metadata_event(event: object) -> None:
+        if getattr(event, "type", None) == "session_info_changed":
+            metadata_names.append(getattr(event, "name", None))
+        await original_emit(event)
+
+    monkeypatch.setattr(session.extension_runtime, "emit_event", record_metadata_event)
+    prompt_task = asyncio.create_task(
+        _collect_session_events(session.prompt("Generate a session name"))
+    )
+    await provider.started.wait()
+
+    assert await session.set_session_name("Manual name") == "Manual name"
+    provider.release.set()
+    await prompt_task
+
+    updated = manager.get_session(record.id)
+    assert updated is not None
+    assert updated.title == "Manual name"
+    assert metadata_names == ["Manual name"]
+
+
+@pytest.mark.anyio
 async def test_session_auto_name_does_not_index_new_session_before_first_persist(
     tmp_path: Path,
 ) -> None:
@@ -3161,6 +3204,7 @@ async def test_session_loads_tau_native_system_prompt_files(tmp_path: Path) -> N
     (tau_home / "SYSTEM.md").write_text("User base", encoding="utf-8")
     (project_tau / "SYSTEM.md").write_text("Project base", encoding="utf-8")
     (tau_home / "APPEND_SYSTEM.md").write_text("User append", encoding="utf-8")
+    (project_tau / "APPEND_SYSTEM.md").write_text("Project append", encoding="utf-8")
     (tmp_path / "AGENTS.md").write_text("Project instructions", encoding="utf-8")
 
     session = await CodingSession.load(
@@ -3174,23 +3218,38 @@ async def test_session_loads_tau_native_system_prompt_files(tmp_path: Path) -> N
         )
     )
 
-    assert session.system_prompt.startswith("Project base\n\nUser append")
+    assert session.system_prompt.startswith("Project base\n\nUser append\n\nProject append")
     assert "User base" not in session.system_prompt
     assert "Project instructions" in session.system_prompt
     assert "Current date:" in session.system_prompt
     assert f"Current working directory: {tmp_path}" in session.system_prompt
+    assert session.system_prompt_files == (
+        project_tau / "SYSTEM.md",
+        tau_home / "APPEND_SYSTEM.md",
+        project_tau / "APPEND_SYSTEM.md",
+    )
     prompt_diagnostics = [
         item for item in session.resource_diagnostics if item.kind == "system-prompt"
     ]
-    assert [item.severity for item in prompt_diagnostics] == ["info", "warning", "info"]
+    assert [item.severity for item in prompt_diagnostics] == [
+        "info",
+        "warning",
+        "info",
+        "info",
+    ]
 
 
 @pytest.mark.anyio
-async def test_explicit_system_prompt_values_override_discovered_files(tmp_path: Path) -> None:
+async def test_explicit_base_overrides_file_while_explicit_append_composes(
+    tmp_path: Path,
+) -> None:
     tau_home = tmp_path / "tau-home"
+    project_tau = tmp_path / ".tau"
     tau_home.mkdir()
+    project_tau.mkdir()
     (tau_home / "SYSTEM.md").write_bytes(b"\xff")
-    (tau_home / "APPEND_SYSTEM.md").write_bytes(b"\xff")
+    (tau_home / "APPEND_SYSTEM.md").write_text("User append", encoding="utf-8")
+    (project_tau / "APPEND_SYSTEM.md").write_text("Project append", encoding="utf-8")
 
     session = await CodingSession.load(
         CodingSessionConfig(
@@ -3199,17 +3258,24 @@ async def test_explicit_system_prompt_values_override_discovered_files(tmp_path:
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
             cwd=tmp_path,
             resource_paths=TauResourcePaths(root=tau_home, agents_root=None),
+            trust_default="always",
             custom_system_prompt="Explicit base",
             append_system_prompt="Explicit append",
         )
     )
 
-    assert session.system_prompt.startswith("Explicit base\n\nExplicit append")
-    assert all(
-        "explicit startup value" in item.message
-        for item in session.resource_diagnostics
-        if item.kind == "system-prompt"
+    assert session.system_prompt.startswith(
+        "Explicit base\n\nUser append\n\nProject append\n\nExplicit append"
     )
+    assert session.system_prompt_files == (
+        tau_home / "APPEND_SYSTEM.md",
+        project_tau / "APPEND_SYSTEM.md",
+    )
+    prompt_diagnostics = [
+        item for item in session.resource_diagnostics if item.kind == "system-prompt"
+    ]
+    assert "explicit startup value" in prompt_diagnostics[0].message
+    assert "selected user" in prompt_diagnostics[1].message
 
 
 @pytest.mark.anyio
@@ -5575,9 +5641,12 @@ async def test_session_name_indexes_pending_session_without_prompt(
     assert manager.get_session(pending_id) is None
 
     result = session.handle_command("/name Customer bugfix")
+    assert result.session_name == "Customer bugfix"
+    renamed = await session.set_session_name(result.session_name)
 
     indexed = manager.get_session(pending_id)
     assert result.message == "Session renamed: Customer bugfix"
+    assert renamed == "Customer bugfix"
     assert indexed is not None
     assert indexed.title == "Customer bugfix"
     assert indexed.provider_name == "openai"

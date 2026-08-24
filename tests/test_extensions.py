@@ -3,6 +3,7 @@
 import asyncio
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -20,6 +21,8 @@ from tau_coding import (
     CodingSession,
     CodingSessionConfig,
     ResourceError,
+    SessionManager,
+    TauPaths,
     TauResourcePaths,
 )
 from tau_coding.extensions import (
@@ -42,6 +45,7 @@ from tau_coding.extensions import (
     load_extensions,
 )
 from tau_coding.project_trust import ProjectTrustRequest, TrustChoice
+from tau_coding.system_prompt import PromptSection
 
 pytestmark = pytest.mark.anyio
 
@@ -117,6 +121,8 @@ class RecordingSession:
         self.inference_provider: str | None = None
         self.inference_provider_mode = "automatic"
         self.session_id = "session-1"
+        self.session_name: str | None = "Test session"
+        self.thinking_level = "medium"
         self.system_prompt = "You are Tau."
         self.is_running = running
         self.messages: tuple[AgentMessage, ...] = ()
@@ -928,6 +934,7 @@ def setup(tau):
     ))
     tau.register_command("orphan-command", _command)
     tau.add_prompt_guideline("orphan guideline")
+    tau.add_prompt_section("Orphan section", "orphan body")
     tau.register_message_renderer("orphan:message", _renderer)
     tau.on("input", _handler)
     entry = Path({str(entry)!r})
@@ -949,6 +956,7 @@ def setup(tau):
     assert runtime.extension_tools == ()
     assert runtime.build_command_registry().get("orphan-command") is None
     assert runtime.prompt_guidelines == ()
+    assert runtime.prompt_sections == ()
     assert runtime.render_custom_message("orphan:message", "content", None, False) is None
     outcome = await runtime.run_input_hooks("unchanged")
     assert outcome.text == "unchanged"
@@ -1035,6 +1043,25 @@ def test_prompt_guideline_registration(tmp_path: Path) -> None:
 
     assert runtime.prompt_guidelines == ("Always run the tests before claiming success",)
     assert any("empty prompt guideline" in diag.message for diag in runtime.diagnostics)
+
+
+def test_prompt_section_registration(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "structured-guidance")
+    api.add_prompt_section("  Review procedure  ", "  First step.\n\n```bash\nuv run pytest\n```  ")
+    api.add_prompt_section("   ", "Untitled context")
+    api.add_prompt_section(None, "   ")
+    api.add_prompt_section("bad\ntitle", "ignored")
+
+    assert runtime.prompt_sections == (
+        PromptSection(
+            title="Review procedure",
+            body="First step.\n\n```bash\nuv run pytest\n```",
+        ),
+        PromptSection(title=None, body="Untitled context"),
+    )
+    assert any("empty prompt section" in diag.message for diag in runtime.diagnostics)
+    assert any("title spans multiple lines" in diag.message for diag in runtime.diagnostics)
 
 
 def test_unknown_event_subscription_is_a_diagnostic(tmp_path: Path) -> None:
@@ -1502,6 +1529,8 @@ def test_transcript_is_empty_at_session_start(tmp_path: Path) -> None:
     session = RecordingSession(tmp_path)
     runtime.bind(session)
 
+    assert api.context.session_name == "Test session"  # type: ignore[attr-defined]
+    assert api.context.thinking_level == "medium"  # type: ignore[attr-defined]
     assert api.context.transcript == ()  # type: ignore[attr-defined]
 
 
@@ -2062,6 +2091,130 @@ async def test_extension_guideline_reaches_system_prompt(tmp_path: Path) -> None
     )
 
     assert "Never commit directly to main" in session.system_prompt
+
+
+async def test_session_metadata_changes_reach_extensions(tmp_path: Path) -> None:
+    config = _session_config(tmp_path, FakeProvider([]))
+    manager = SessionManager(
+        TauPaths(home=tmp_path / "manager-tau", agents_home=tmp_path / "manager-agents")
+    )
+    record = manager.create_session(cwd=config.cwd, model="fake", title="Old name")
+    session = await CodingSession.load(
+        replace(
+            config,
+            storage=JsonlSessionStorage(record.path),
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+    api = cast(ExtensionAPI, _register_inline_extension(session.extension_runtime, "observer"))
+    seen: list[tuple[str, str | None, str | None, str, str]] = []
+
+    def record_event(event: object, context: object) -> None:
+        seen.append(
+            (
+                event.type,  # type: ignore[attr-defined]
+                getattr(event, "name", None),
+                getattr(event, "level", None),
+                context.session_name,  # type: ignore[attr-defined]
+                context.thinking_level,  # type: ignore[attr-defined]
+            )
+        )
+
+    api.on("session_info_changed", record_event)
+    api.on("thinking_level_changed", record_event)
+
+    with pytest.raises(ValueError, match="single line"):
+        await session.set_session_name("bad\nname")
+
+    assert await session.set_session_name("New name") == "New name"
+    assert await session.set_thinking_level("high") == "Thinking mode: high"
+    # Assigning either current value is a no-op and must not duplicate events.
+    assert await session.set_session_name("New name") == "New name"
+    assert await session.set_thinking_level("high") == "Thinking mode: high"
+
+    assert seen == [
+        ("session_info_changed", "New name", None, "New name", "medium"),
+        ("thinking_level_changed", None, "high", "New name", "high"),
+    ]
+    assert api.context.thinking_level == "high"
+
+
+async def test_auto_session_name_change_reaches_extensions(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Fix pane title")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done")),
+            ],
+        ]
+    )
+    config = _session_config(tmp_path, provider)
+    manager = SessionManager(
+        TauPaths(home=tmp_path / "manager-tau", agents_home=tmp_path / "manager-agents")
+    )
+    record = manager.create_session(cwd=config.cwd, model="fake")
+    session = await CodingSession.load(
+        replace(
+            config,
+            storage=JsonlSessionStorage(record.path),
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+    api = cast(ExtensionAPI, _register_inline_extension(session.extension_runtime, "observer"))
+    seen: list[tuple[str | None, str | None]] = []
+    api.on(
+        "session_info_changed",
+        lambda event, context: seen.append((event.name, context.session_name)),
+    )
+
+    _ = [event async for event in session.prompt("Please fix the pane title")]
+
+    assert seen == [("Fix pane title", "Fix pane title")]
+
+
+async def test_extension_prompt_section_reaches_system_prompt_after_user_append(
+    tmp_path: Path,
+) -> None:
+    body = (
+        "def setup(tau):\n"
+        "    tau.add_prompt_section('Review procedure', "
+        "'First step.\\n\\n```bash\\nuv run pytest\\n```')\n"
+    )
+    config = _session_config(tmp_path, FakeProvider([]), extension_body=body)
+    config = replace(config, append_system_prompt="User append")
+
+    session = await CodingSession.load(config)
+
+    assert (
+        "## Review procedure\n\nFirst step.\n\n```bash\nuv run pytest\n```" in session.system_prompt
+    )
+    assert session.system_prompt.index("User append") < session.system_prompt.index(
+        "## Review procedure"
+    )
+
+
+async def test_reload_picks_up_prompt_section_changes(tmp_path: Path) -> None:
+    provider = FakeProvider([])
+    session = await CodingSession.load(_session_config(tmp_path, provider))
+    assert "## Late procedure" not in session.system_prompt
+
+    paths = _paths(tmp_path)
+    _write_extension(
+        _user_extensions_dir(paths),
+        "late_section",
+        "def setup(tau):\n    tau.add_prompt_section('Late procedure', 'Run the checks.')\n",
+    )
+
+    summary = await session.reload()
+
+    assert summary.system_prompt_rebuilt is True
+    assert "## Late procedure\n\nRun the checks." in session.system_prompt
 
 
 async def test_reload_picks_up_guideline_changes(tmp_path: Path) -> None:
@@ -2720,6 +2873,10 @@ async def test_reset_for_reload_invalidates_prior_context_and_ui(tmp_path: Path)
         _ = context.cwd
     with pytest.raises(ExtensionError, match="stale after reload"):
         _ = context.transcript
+    with pytest.raises(ExtensionError, match="stale after reload"):
+        _ = context.session_name
+    with pytest.raises(ExtensionError, match="stale after reload"):
+        _ = context.thinking_level
     # Trivial reads assert too (Pi asserts on everything).
     with pytest.raises(ExtensionError, match="stale after reload"):
         _ = context.has_ui

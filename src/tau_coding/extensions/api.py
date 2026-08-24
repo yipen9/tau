@@ -921,6 +921,18 @@ class ExtensionContext:
         return self._runtime.session_view.session_id
 
     @property
+    def session_name(self) -> str | None:
+        """Return the session's human-friendly name, if it has one."""
+        self._generation.assert_active()
+        return self._runtime.session_view.session_name
+
+    @property
+    def thinking_level(self) -> str:
+        """Return the active thinking mode for future turns."""
+        self._generation.assert_active()
+        return self._runtime.session_view.thinking_level
+
+    @property
     def system_prompt(self) -> str:
         """Return the active system prompt."""
         self._generation.assert_active()
@@ -1060,6 +1072,21 @@ class ExtensionAPI:
         """
         self._generation.assert_active()
         self._runtime.register_prompt_guideline(self._source_id, self._extension_name, guideline)
+
+    def add_prompt_section(self, title: str | None, body: str) -> None:
+        """Append a free-form, optionally titled section to the system prompt.
+
+        Use this for structured, always-on extension context such as procedures,
+        paragraphs, and code blocks. Use :meth:`add_prompt_guideline` for one
+        behavioral bullet instead.
+        """
+        self._generation.assert_active()
+        self._runtime.register_prompt_section(
+            self._source_id,
+            self._extension_name,
+            title,
+            body,
+        )
 
     def on(
         self,

@@ -215,6 +215,7 @@ class FakeSession:
         self.context_files = (
             ProjectContextFile(path=str(self.cwd / "AGENTS.md"), content="Follow rules."),
         )
+        self.system_prompt_files: tuple[Path, ...] = ()
         self.context_token_estimate = 12034
         self.has_provider_context_usage = True
         self.auto_compact_token_threshold = 200000
@@ -342,10 +343,11 @@ class FakeSession:
         if text.startswith("/theme "):
             return CommandResult(handled=True, theme=text.removeprefix("/theme "))
         if text.startswith("/name "):
-            self._session_title = text.removeprefix("/name ")
+            name = text.removeprefix("/name ")
             return CommandResult(
                 handled=True,
-                message=f"Session renamed: {self._session_title}",
+                session_name=name,
+                message=f"Session renamed: {name}",
             )
         return CommandResult(handled=False)
 
@@ -390,6 +392,10 @@ class FakeSession:
 
     async def refresh_model_catalogs(self) -> None:
         self.model_catalog_refresh_count += 1
+
+    async def set_session_name(self, name: str) -> str:
+        self._session_title = name
+        return name
 
     async def set_thinking_level(self, level: str) -> str:
         self.thinking_level = level
@@ -684,6 +690,30 @@ def test_session_sidebar_limits_context_files_to_five() -> None:
     assert "...(2 more)" in output
 
 
+def test_session_sidebar_lists_active_system_prompt_files() -> None:
+    session = FakeSession()
+    session.system_prompt_files = (
+        session.cwd / ".tau" / "SYSTEM.md",
+        Path.home() / ".tau" / "APPEND_SYSTEM.md",
+    )
+    console = Console(record=True, width=80)
+
+    console.print(render_session_sidebar(session))
+
+    output = console.export_text()
+    assert "system prompt" in output
+    assert "• .tau/SYSTEM.md" in output
+    assert "• ~/.tau/APPEND_SYSTEM.md" in output
+
+
+def test_session_sidebar_omits_system_prompt_section_without_active_files() -> None:
+    console = Console(record=True, width=80)
+
+    console.print(render_session_sidebar(FakeSession()))
+
+    assert "system prompt" not in console.export_text()
+
+
 def test_comma_list_limits_by_rendered_lines_instead_of_item_count() -> None:
     items = [f"i{index}" for index in range(1, 16)]
 
@@ -800,7 +830,7 @@ def test_session_sidebar_brand_includes_current_version() -> None:
 
     console.print(_sidebar_brand(theme=TAU_DARK_THEME))
 
-    assert "τ = 2π  0.3.13" in console.export_text()
+    assert "τ = 2π  0.4.0" in console.export_text()
 
 
 def test_session_sidebar_uses_prominent_title_and_accented_section_headers() -> None:
@@ -3452,6 +3482,24 @@ async def test_tui_transcript_code_block_scrollbar_matches_overflow(
         assert fence.allow_horizontal_scroll is True
         assert (fence.max_scroll_x > 0) is has_horizontal_overflow
         assert fence.show_horizontal_scrollbar is has_horizontal_overflow
+
+
+@pytest.mark.anyio
+async def test_tui_transcript_code_fence_ignores_invalid_highlighter_spans() -> None:
+    app = TauTuiApp(
+        FakeSession(
+            messages=[AssistantMessage(content="```ini\nkeybind = alt+arrow_left=text:\\\n```")]
+        )
+    )
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        label = app.query_one("#code-content", Label)
+        content = label.render()
+
+    assert isinstance(content, Content)
+    assert content.plain == "keybind = alt+arrow_left=text:\\"
+    assert all(0 <= span.start < span.end <= len(content.plain) for span in content.spans)
 
 
 @pytest.mark.anyio
