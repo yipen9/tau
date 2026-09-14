@@ -22,7 +22,12 @@ from tau_coding.provider_config import (
 from tau_coding.rendering import PrintOutputMode
 from tau_coding.resources import TauResourcePaths
 from tau_coding.skills import load_skills
-from tau_coding.system_prompt import BuildSystemPromptOptions, build_system_prompt
+from tau_coding.system_prompt import (
+    BuildSystemPromptOptions,
+    build_system_prompt,
+    build_system_prompt_inspection,
+    format_system_prompt_inspection,
+)
 from tau_coding.tools import create_coding_tools
 from tau_coding.update_check import (
     ReleaseNoteSection,
@@ -758,7 +763,7 @@ async def test_run_print_mode_system_command_prints_prompt_without_provider_call
     )
 
     captured = capsys.readouterr()
-    expected_system = build_system_prompt(
+    inspection = build_system_prompt_inspection(
         BuildSystemPromptOptions(
             cwd=tmp_path,
             tools=create_coding_tools(cwd=tmp_path),
@@ -766,7 +771,7 @@ async def test_run_print_mode_system_command_prints_prompt_without_provider_call
         )
     )
     assert ok is True
-    assert captured.out == f"{expected_system}\n"
+    assert captured.out == f"{format_system_prompt_inspection(inspection)}\n"
     assert captured.err == ""
     assert provider.calls == []
     assert await storage.read_all() == []
@@ -852,7 +857,7 @@ async def test_run_print_mode_persists_session_entries(
     assert [message.role for message in messages] == ["user", "assistant"]
     assert messages[0].content == "Say hello"
     assert messages[1].text == "Done"
-    assert any(entry.type == "leaf" for entry in entries)
+    assert not any(entry.type == "leaf" for entry in entries)
 
 
 @pytest.mark.anyio
@@ -860,9 +865,14 @@ async def test_run_print_mode_resumes_persisted_conversation(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    await storage.append(MessageEntry(message=UserMessage(content="First question")))
-    await storage.append(MessageEntry(message=AssistantMessage(content="First answer")))
-    await storage.append(ModelChangeEntry(model="model-a"))
+    user_entry = MessageEntry(message=UserMessage(content="First question"))
+    assistant_entry = MessageEntry(
+        parent_id=user_entry.id,
+        message=AssistantMessage(content="First answer"),
+    )
+    await storage.append(user_entry)
+    await storage.append(assistant_entry)
+    await storage.append(ModelChangeEntry(parent_id=assistant_entry.id, model="model-a"))
     provider = FakeProvider(
         [
             [
@@ -1975,3 +1985,101 @@ async def test_headless_ask_declines_without_corrupting_structured_stdout(
     assert "PROTECTED-STRUCTURED-SECRET" not in provider.calls[0][1]
     assert "Project inputs" not in captured.out
     assert "Project inputs" in captured.err
+
+
+def test_thinking_flag_forwards_to_tui_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    async def fake_run_openai_tui(*args: object, **kwargs: object) -> None:
+        calls.append(kwargs.get("thinking_level_override"))
+
+    monkeypatch.setattr(cli, "_startup_update_notice", lambda: None)
+    monkeypatch.setattr(cli, "run_openai_tui", fake_run_openai_tui)
+
+    result = CliRunner().invoke(app, ["--thinking", "high", "--new-session"])
+
+    assert result.exit_code == 0
+    assert calls == ["high"]
+
+
+def test_thinking_flag_forwards_to_print_mode_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    async def fake_run_openai_print_mode(*args: object, **kwargs: object) -> bool:
+        calls.append(kwargs.get("thinking_level_override"))
+        return True
+
+    monkeypatch.setattr(cli, "_startup_update_notice", lambda: None)
+    monkeypatch.setattr(cli, "run_openai_print_mode", fake_run_openai_print_mode)
+
+    result = CliRunner().invoke(app, ["--print", "-t", "low", "hello"])
+
+    assert result.exit_code == 0
+    assert calls == ["low"]
+
+
+def test_thinking_flag_forwards_to_rpc_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    async def fake_run_openai_rpc_mode(*args: object, **kwargs: object) -> None:
+        calls.append(kwargs.get("thinking_level_override"))
+
+    monkeypatch.setattr(cli, "run_openai_rpc_mode", fake_run_openai_rpc_mode)
+
+    result = CliRunner().invoke(app, ["--mode", "rpc", "--thinking", "xhigh"])
+
+    assert result.exit_code == 0
+    assert calls == ["xhigh"]
+
+
+def test_thinking_flag_rejects_invalid_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_run_openai_tui(*args: object, **kwargs: object) -> None:
+        raise AssertionError("TUI must not start for an invalid thinking level")
+
+    monkeypatch.setattr(cli, "_startup_update_notice", lambda: None)
+    monkeypatch.setattr(cli, "run_openai_tui", fake_run_openai_tui)
+
+    result = CliRunner().invoke(app, ["--thinking", "maximum", "--new-session"])
+
+    assert result.exit_code == 2
+    assert "Unknown thinking mode: maximum" in _panel_text(result.output)
+
+
+def test_thinking_flag_accepts_case_insensitive_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    async def fake_run_openai_tui(*args: object, **kwargs: object) -> None:
+        calls.append(kwargs.get("thinking_level_override"))
+
+    monkeypatch.setattr(cli, "_startup_update_notice", lambda: None)
+    monkeypatch.setattr(cli, "run_openai_tui", fake_run_openai_tui)
+
+    result = CliRunner().invoke(app, ["-t", "HIGH", "--new-session"])
+
+    assert result.exit_code == 0
+    assert calls == ["high"]
+
+
+def test_thinking_flag_absent_forwards_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    async def fake_run_openai_tui(*args: object, **kwargs: object) -> None:
+        calls.append(kwargs.get("thinking_level_override"))
+
+    monkeypatch.setattr(cli, "_startup_update_notice", lambda: None)
+    monkeypatch.setattr(cli, "run_openai_tui", fake_run_openai_tui)
+
+    result = CliRunner().invoke(app, ["--new-session"])
+
+    assert result.exit_code == 0
+    assert calls == [None]
+
+
+def test_help_lists_thinking_option() -> None:
+    result = CliRunner().invoke(app, ["--help"], env={"COLUMNS": "160"})
+
+    output = re.sub(r"\s+", "", _strip_ansi(result.output))
+    assert result.exit_code == 0
+    assert "--thinking" in output

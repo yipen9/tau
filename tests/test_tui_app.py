@@ -1,10 +1,12 @@
 import asyncio
 import re
+import threading
 from collections.abc import AsyncIterator
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import BinaryIO
 
 import pytest
 from rich.console import Console
@@ -17,7 +19,16 @@ from textual.content import Content
 from textual.content import Style as TextualStyle
 from textual.geometry import Offset
 from textual.selection import SELECT_ALL, Selection
-from textual.widgets import Collapsible, Input, Label, ListItem, ListView, Static, TextArea
+from textual.widgets import (
+    Collapsible,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    OptionList,
+    Static,
+    TextArea,
+)
 from textual.widgets import Markdown as TextualMarkdown
 from textual.widgets.markdown import MarkdownStream
 
@@ -87,9 +98,15 @@ from tau_coding.session import (
 from tau_coding.session_manager import CodingSessionRecord
 from tau_coding.session_stats import SessionStats
 from tau_coding.skills import Skill, format_skill_invocation
-from tau_coding.system_prompt import ProjectContextFile
+from tau_coding.system_prompt import (
+    ProjectContextFile,
+    SystemPromptInspection,
+    SystemPromptSource,
+    format_system_prompt_inspection,
+)
 from tau_coding.tools import create_coding_tools
 from tau_coding.tui import app as tui_app
+from tau_coding.tui.adapter import TuiEventAdapter
 from tau_coding.tui.app import (
     COMPLETION_MAX_VISIBLE_LINES,
     PASTE_DISPLAY_THRESHOLD,
@@ -109,6 +126,7 @@ from tau_coding.tui.app import (
     PromptTemplateEditorScreen,
     PromptTemplatePickerScreen,
     SessionPickerScreen,
+    SidebarFileEditor,
     SkillPickerScreen,
     TauTuiApp,
     ThemePickerScreen,
@@ -118,13 +136,16 @@ from tau_coding.tui.app import (
     _completion_selected_render_line,
     _render_activity_indicator,
     _resource_conflict_alert,
+    _session_picker_label,
+    _session_records,
+    _short_path,
     _terminal_command_prefix_span,
     _textual_theme_for_tau_theme,
     _theme_css_variables,
     _TuiExtensionUiBridge,
     _visible_completion_state,
 )
-from tau_coding.tui.autocomplete import CompletionItem, CompletionState
+from tau_coding.tui.autocomplete import CompletionItem, CompletionKind, CompletionState
 from tau_coding.tui.config import (
     HIGH_CONTRAST_THEME,
     TAU_DARK_THEME,
@@ -144,7 +165,10 @@ from tau_coding.tui.widgets import (
     CompactSessionInfo,
     LeftAlignedMarkdownHeading,
     SessionSidebar,
+    SidebarFileItem,
     StreamingTranscriptMessageWidget,
+    SystemPromptSectionWidget,
+    SystemPromptSourcesWidget,
     TauMarkdownBlock,
     ThemedMarkdownWidget,
     TranscriptMessageWidget,
@@ -152,6 +176,7 @@ from tau_coding.tui.widgets import (
     TranscriptWindowBoundary,
     _comma_list,
     _compact_token_count,
+    _format_milliseconds,
     _sidebar_brand,
     _split_rich_style_colors,
     _styled_cwd,
@@ -165,6 +190,41 @@ from tau_coding.tui.widgets import (
 )
 
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_herdr_uses_textual_cell_mouse_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.delenv("TEXTUAL_SMOOTH_SCROLL", raising=False)
+    monkeypatch.setattr(tui_app.textual_constants, "SMOOTH_SCROLL", True)
+
+    tui_app._configure_herdr_textual_mouse()
+
+    assert tui_app.os.environ["TEXTUAL_SMOOTH_SCROLL"] == "0"
+    assert tui_app.textual_constants.SMOOTH_SCROLL is False
+
+
+def test_herdr_preserves_explicit_textual_smooth_scroll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setenv("TEXTUAL_SMOOTH_SCROLL", "1")
+    monkeypatch.setattr(tui_app.textual_constants, "SMOOTH_SCROLL", True)
+
+    tui_app._configure_herdr_textual_mouse()
+
+    assert tui_app.os.environ["TEXTUAL_SMOOTH_SCROLL"] == "1"
+    assert tui_app.textual_constants.SMOOTH_SCROLL is True
+
+
+def test_non_herdr_terminal_keeps_textual_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    monkeypatch.delenv("TEXTUAL_SMOOTH_SCROLL", raising=False)
+    monkeypatch.setattr(tui_app.textual_constants, "SMOOTH_SCROLL", True)
+
+    tui_app._configure_herdr_textual_mouse()
+
+    assert "TEXTUAL_SMOOTH_SCROLL" not in tui_app.os.environ
+    assert tui_app.textual_constants.SMOOTH_SCROLL is True
 
 
 def _strip_ansi(text: str) -> str:
@@ -233,14 +293,21 @@ class FakeSession:
             cached_input_tokens=1_140_000,
             latest_prompt_tokens=1_200_000,
             latest_cached_input_tokens=1_188_000,
+            timed_output_tokens=48_000,
+            response_duration_ms=1_200_000,
+            time_to_first_output_ms=18_000,
+            timed_first_output_count=15,
             estimated_cost=1.24,
         )
         self.system_prompt = "You are Tau."
+        self.system_prompt_sources: tuple[SystemPromptSource, ...] | None = None
         self.session_manager = None
         self._session_title: str | None = None
         self.compact_summaries: list[str] = []
         self.resumed_session_ids: list[str] = []
         self.tree_branch_requests: list[tuple[str, bool, str | None]] = []
+        self.tree_label_requests: list[tuple[str, str | None]] = []
+        self.tree_labels: dict[str, tuple[str, float]] = {}
         self.new_session_count = 0
         self.prompt_texts: list[str] = []
         self.prompt_sources: list[str] = []
@@ -282,7 +349,23 @@ class FakeSession:
                 message="Reloaded local coding resources and project context.",
             )
         if text == "/system":
-            return CommandResult(handled=True, message=self.system_prompt)
+            inspection = SystemPromptInspection(
+                text=self.system_prompt,
+                sources=self.system_prompt_sources
+                or (
+                    SystemPromptSource(
+                        kind="runtime",
+                        label="Effective system prompt",
+                        source="active Tau session",
+                        content=self.system_prompt,
+                    ),
+                ),
+            )
+            return CommandResult(
+                handled=True,
+                message=format_system_prompt_inspection(inspection),
+                system_prompt_inspection=inspection,
+            )
         if text == "/skills":
             return CommandResult(handled=True, skills_picker_requested=True)
         if text == "/new":
@@ -340,6 +423,8 @@ class FakeSession:
             return CommandResult(handled=True, thinking_level=text.removeprefix("/thinking "))
         if text == "/theme":
             return CommandResult(handled=True, theme_picker_requested=True)
+        if text == "/sidebar":
+            return CommandResult(handled=True, sidebar_toggle_requested=True)
         if text.startswith("/theme "):
             return CommandResult(handled=True, theme=text.removeprefix("/theme "))
         if text.startswith("/name "):
@@ -367,15 +452,16 @@ class FakeSession:
         self.scoped_model_choices = tuple(scoped)
         return self.scoped_model_choices
 
-    def cycle_scoped_model(self) -> ModelChoice:
+    def cycle_scoped_model(self, *, reverse: bool = False) -> ModelChoice:
         if not self.scoped_model_choices:
             raise ValueError("No scoped models configured.")
         current = ModelChoice(provider_name=self.provider_name, model=self.model)
         try:
             index = self.scoped_model_choices.index(current)
         except ValueError:
-            index = -1
-        choice = self.scoped_model_choices[(index + 1) % len(self.scoped_model_choices)]
+            index = -1 if not reverse else 0
+        delta = -1 if reverse else 1
+        choice = self.scoped_model_choices[(index + delta) % len(self.scoped_model_choices)]
         self.set_model_choice(choice)
         return choice
 
@@ -429,9 +515,23 @@ class FakeSession:
         return (
             SessionTreeChoice(entry_id="root", label="user: Root"),
             SessionTreeChoice(entry_id="tool", label="tool call: read", is_tool_call=True),
-            SessionTreeChoice(entry_id="left", label="assistant: Left"),
+            SessionTreeChoice(
+                entry_id="left",
+                label="assistant: Left",
+                bookmark_label=self.tree_labels.get("left", (None, None))[0],
+                label_timestamp=self.tree_labels.get("left", (None, None))[1],
+            ),
             SessionTreeChoice(entry_id="right", label="assistant: Right", active=True),
         )
+
+    async def set_label(self, entry_id: str, label: str | None) -> SimpleNamespace:
+        self.tree_label_requests.append((entry_id, label))
+        timestamp = 1_700_000_000.0 + len(self.tree_label_requests)
+        if label is None:
+            self.tree_labels.pop(entry_id, None)
+        else:
+            self.tree_labels[entry_id] = (label, timestamp)
+        return SimpleNamespace(timestamp=timestamp)
 
     async def branch_to_entry(
         self,
@@ -521,6 +621,17 @@ def _visible_footer_bindings(app: TauTuiApp) -> dict[str, str]:
     }
 
 
+@pytest.mark.parametrize(
+    ("milliseconds", "expected"),
+    [(999, "999ms"), (1000, "1.0s"), (999.6, "1.0s")],
+)
+def test_format_milliseconds_handles_unit_boundary(
+    milliseconds: float,
+    expected: str,
+) -> None:
+    assert _format_milliseconds(milliseconds) == expected
+
+
 def test_session_sidebar_renders_session_metadata() -> None:
     console = Console(record=True, width=80)
 
@@ -545,6 +656,7 @@ def test_session_sidebar_renders_session_metadata() -> None:
     assert "cumulative usage" not in output
     assert "1.2m in, 48k out · ~$1.24" in output
     assert "cache: 99% latest · 95% session" in output
+    assert "avg TPS: 40.0 · avg TTFT: 1.2s" in output
     assert "auto at 200k" in output
     assert "read, write, edit, bash" in output
     assert re.search(r"\./\.tau/skills\s+• review", output)
@@ -830,7 +942,7 @@ def test_session_sidebar_brand_includes_current_version() -> None:
 
     console.print(_sidebar_brand(theme=TAU_DARK_THEME))
 
-    assert "τ = 2π  0.4.0" in console.export_text()
+    assert "τ = 2π  0.4.4" in console.export_text()
 
 
 def test_session_sidebar_uses_prominent_title_and_accented_section_headers() -> None:
@@ -1066,12 +1178,34 @@ def test_state_load_messages_projects_custom_type_on_resume() -> None:
                 custom_type="subagent-notification",
                 details={"id": "run-1"},
             ),
+            CustomMessage(
+                content="hidden model context",
+                custom_type="extension:hidden",
+                display=False,
+            ),
         ]
     )
 
     assert [item.role for item in state.items] == ["user", "custom"]
     assert state.items[1].custom_type == "subagent-notification"
     assert state.items[1].details == {"id": "run-1"}
+
+
+def test_tui_event_adapter_hides_non_display_custom_messages() -> None:
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+
+    adapter.apply(
+        MessageEndEvent(
+            message=CustomMessage(
+                content="hidden model context",
+                custom_type="extension:hidden",
+                display=False,
+            )
+        )
+    )
+
+    assert state.items == []
 
 
 def test_chat_items_render_as_unlabeled_blocks() -> None:
@@ -2961,6 +3095,36 @@ async def test_tau_markdown_block_remains_selectable_after_mount() -> None:
 
 
 @pytest.mark.anyio
+async def test_detached_transcript_message_ignores_stale_selection_hit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        widget = StreamingTranscriptMessageWidget(
+            ChatItem(role="assistant", text="Select this message."), theme=TAU_DARK_THEME
+        )
+        assert widget.allow_select is False
+        await app.query_one("#transcript").mount(widget)
+        await widget.finalize()
+        await pilot.pause()
+        assert widget.allow_select is True
+        await widget.remove()
+        assert widget.parent is None
+        assert widget.allow_select is False
+
+        # Model a compositor hit left over from before the widget was removed.
+        from textual.geometry import Offset
+
+        monkeypatch.setattr(
+            app.screen, "get_widget_and_offset_at", lambda x, y: (widget, Offset(0, 0))
+        )
+        app.screen._forward_event(events.MouseDown(None, 1, 1, 0, 0, 1, False, False, False))
+        assert app.screen._select_state is None
+        await pilot.pause()
+
+
+@pytest.mark.anyio
 async def test_tui_app_disables_text_selection_while_agent_is_running() -> None:
     app = TauTuiApp(FakeSession())
 
@@ -3102,6 +3266,29 @@ async def test_tui_app_footer_hints_update_for_completions() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_app_footer_hints_explain_file_reference_enter_behavior(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("# Project\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 30)):
+        prompt = app.query_one("#prompt")
+        prompt.value = "inspect @READ"
+        app._completion_state = app._build_completion_state(prompt.value)
+        app._refresh_completions()
+
+        assert _visible_footer_bindings(app) == {
+            "Choose": "Up/Down",
+            "Complete": "Tab",
+            "Submit raw": "enter",
+            "Close": "escape",
+        }
+
+
+@pytest.mark.anyio
 async def test_tui_app_footer_hints_update_while_running() -> None:
     app = TauTuiApp(FakeSession())
 
@@ -3203,6 +3390,363 @@ async def test_tui_sidebar_resource_sections_expand_independently() -> None:
         await pilot.click("#sidebar-skills CollapsibleTitle")
         assert skills.collapsed is True
         assert prompts.collapsed is False
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_context_file_opens_in_main_editor_and_saves(tmp_path: Path) -> None:
+    context_path = tmp_path / "AGENTS.md"
+    context_path.write_text("Original context.\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.context_files = (
+        ProjectContextFile(path=str(context_path), content="Original context."),
+    )
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.click("#sidebar-context-content .sidebar-file-item")
+        await pilot.pause()
+
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        assert editor.path == context_path
+        assert editor.kind == "Context"
+        assert not app.query_one("#transcript", TranscriptView).display
+        editor_input = editor.query_one("#sidebar-file-editor-input", TextArea)
+        assert editor_input.text == "Original context.\n"
+
+        editor_input.text = "Updated context.\n"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        assert context_path.read_text(encoding="utf-8") == "Updated context.\n"
+        assert editor.query_one("#sidebar-file-editor-status", Static).render().plain == (
+            f"Saved {context_path}"
+        )
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query_one("#transcript", TranscriptView).display
+        assert app.query_one("#prompt", PromptInput).has_focus
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_prompt_file_opens_in_main_editor(tmp_path: Path) -> None:
+    prompt_path = tmp_path / ".tau" / "prompts" / "review.md"
+    prompt_path.parent.mkdir(parents=True)
+    prompt_path.write_text("Review this.\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.prompt_templates = (
+        PromptTemplate("review", prompt_path, "Review this.", "Review changes"),
+    )
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.query_one("#sidebar-prompts", Collapsible).collapsed = False
+        await pilot.pause()
+        await pilot.click("#sidebar-prompts-content .sidebar-file-item")
+        await pilot.pause()
+
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        assert editor.path == prompt_path
+        assert editor.kind == "Prompt"
+        editor_input = editor.query_one("#sidebar-file-editor-input", TextArea)
+        assert editor_input.text == "Review this.\n"
+
+        editor_input.text = "first\nsecond"
+        editor_input.move_cursor((0, 0))
+        await pilot.press("right")
+        assert editor_input.cursor_location == (0, 1)
+        await pilot.press("down")
+        assert editor_input.cursor_location == (1, 1)
+        await pilot.press("left")
+        assert editor_input.cursor_location == (1, 0)
+        await pilot.press("up")
+        assert editor_input.cursor_location == (0, 0)
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_skill_opens_only_main_skill_file(tmp_path: Path) -> None:
+    skill_path = tmp_path / ".agents" / "skills" / "review" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("# Review\n", encoding="utf-8")
+    (skill_path.parent / "reference.md").write_text("Supporting notes.\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.skills = (Skill("review", skill_path, "# Review", "Review changes"),)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.query_one("#sidebar-skills", Collapsible).collapsed = False
+        await pilot.pause()
+        skill_items = app.query("#sidebar-skills-content .sidebar-file-item")
+        assert len(skill_items) == 1
+        await pilot.click("#sidebar-skills-content .sidebar-file-item")
+        await pilot.pause()
+
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        assert editor.path == skill_path
+        assert editor.kind == "Skill"
+        editor_path = editor.query_one("#sidebar-file-editor-path", Static).render().plain
+        assert "reference.md" not in editor_path
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_file_items_have_clear_hover_style(tmp_path: Path) -> None:
+    context_path = tmp_path / "AGENTS.md"
+    context_path.write_text("Rules.\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.context_files = (ProjectContextFile(path=str(context_path), content="Rules."),)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        item = app.query_one("#sidebar-context-content .sidebar-file-item", SidebarFileItem)
+        await pilot.hover("#sidebar-context-content .sidebar-file-item")
+
+        assert item.styles.background == Color.parse(TAU_DARK_THEME.highlight_background)
+        assert item.styles.color == Color.parse(TAU_DARK_THEME.highlight_text)
+        assert item.styles.text_style.underline
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_editor_keeps_contents_open_after_save_failure(tmp_path: Path) -> None:
+    context_path = tmp_path / "nested" / "AGENTS.md"
+    context_path.parent.mkdir()
+    context_path.write_text("Rules.\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.context_files = (ProjectContextFile(path=str(context_path), content="Rules."),)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.click("#sidebar-context-content .sidebar-file-item")
+        await pilot.pause()
+        context_path.unlink()
+        context_path.parent.rmdir()
+
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        editor.query_one("#sidebar-file-editor-input", TextArea).text = "Unsaved changes.\n"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        assert editor.is_mounted
+        assert (
+            "Could not save"
+            in editor.query_one("#sidebar-file-editor-status", Static).render().plain
+        )
+        assert not context_path.exists()
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_editor_reports_unexpected_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context_path = tmp_path / "AGENTS.md"
+    context_path.write_text("Rules.\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.context_files = (ProjectContextFile(path=str(context_path), content="Rules."),)
+    app = TauTuiApp(session)
+
+    def fail_unexpectedly(*args: object) -> None:
+        del args
+        raise RuntimeError("simulated unexpected failure")
+
+    monkeypatch.setattr(tui_app, "_atomic_write_sidebar_file", fail_unexpectedly)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.click("#sidebar-context-content .sidebar-file-item")
+        await pilot.pause()
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        editor.query_one("#sidebar-file-editor-input", TextArea).text = "Updated.\n"
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        status = editor.query_one("#sidebar-file-editor-status", Static).render().plain
+        assert "Could not save" in status
+        assert "simulated unexpected failure" in status
+        assert editor._saving is False
+        assert context_path.read_text(encoding="utf-8") == "Rules.\n"
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_editor_refuses_external_file_changes(tmp_path: Path) -> None:
+    context_path = tmp_path / "AGENTS.md"
+    context_path.write_text("Original.\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.context_files = (ProjectContextFile(path=str(context_path), content="Original."),)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.click("#sidebar-context-content .sidebar-file-item")
+        await pilot.pause()
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        editor.query_one("#sidebar-file-editor-input", TextArea).text = "Editor changes.\n"
+        context_path.write_text("External changes.\n", encoding="utf-8")
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        status = editor.query_one("#sidebar-file-editor-status", Static).render().plain
+        assert "File changed on disk" in status
+        assert editor.is_mounted
+        assert context_path.read_text(encoding="utf-8") == "External changes.\n"
+        assert not tuple(tmp_path.glob(f".{context_path.name}.*.tmp"))
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_editor_blocks_switch_with_unsaved_changes(tmp_path: Path) -> None:
+    first_path = tmp_path / "AGENTS.md"
+    second_path = tmp_path / "CLAUDE.md"
+    first_path.write_text("First.\n", encoding="utf-8")
+    second_path.write_text("Second.\n", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.context_files = (
+        ProjectContextFile(path=str(first_path), content="First."),
+        ProjectContextFile(path=str(second_path), content="Second."),
+    )
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        items = list(app.query("#sidebar-context-content .sidebar-file-item"))
+        items[0].post_message(SidebarFileItem.OpenRequested(items[0]))
+        await pilot.pause()
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        editor.query_one("#sidebar-file-editor-input", TextArea).text = "Unsaved.\n"
+
+        items[1].post_message(SidebarFileItem.OpenRequested(items[1]))
+        await pilot.pause()
+
+        assert app.query_one("#sidebar-file-editor", SidebarFileEditor) is editor
+        assert editor.path == first_path
+        assert editor.query_one("#sidebar-file-editor-input", TextArea).text == "Unsaved.\n"
+        status = editor.query_one("#sidebar-file-editor-status", Static).render().plain
+        assert status == "Save or close the current file before opening another."
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_editor_partial_staging_failure_is_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context_path = tmp_path / "AGENTS.md"
+    original = b"Original rules.\n"
+    context_path.write_bytes(original)
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.context_files = (ProjectContextFile(path=str(context_path), content="Original rules."),)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.click("#sidebar-context-content .sidebar-file-item")
+        await pilot.pause()
+
+        def fail_after_partial_stage(handle: BinaryIO, source: str) -> None:
+            del source
+            handle.write(b"partial")
+            handle.flush()
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(tui_app, "_write_staged_utf8", fail_after_partial_stage)
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        editor.query_one("#sidebar-file-editor-input", TextArea).text = "Replacement rules.\n"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        status = editor.query_one("#sidebar-file-editor-status", Static).render().plain
+        assert editor.is_mounted
+        assert "Could not save" in status
+        assert "simulated disk full" in status
+        assert context_path.read_bytes() == original
+        assert not tuple(tmp_path.glob(f".{context_path.name}.*.tmp"))
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_editor_rejects_read_only_target(tmp_path: Path) -> None:
+    context_path = tmp_path / "AGENTS.md"
+    original = b"Original rules.\n"
+    context_path.write_bytes(original)
+    context_path.chmod(0o444)
+    original_mode = context_path.stat().st_mode
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.context_files = (ProjectContextFile(path=str(context_path), content="Original rules."),)
+    app = TauTuiApp(session)
+    notifications: list[tuple[str, str | None]] = []
+
+    def fake_notify(message: str, **kwargs: object) -> None:
+        severity = kwargs.get("severity")
+        notifications.append((message, severity if isinstance(severity, str) else None))
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.click("#sidebar-context-content .sidebar-file-item")
+        await pilot.pause()
+
+        editor = app.query_one("#sidebar-file-editor", SidebarFileEditor)
+        editor.query_one("#sidebar-file-editor-input", TextArea).text = "Replacement rules.\n"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        status = editor.query_one("#sidebar-file-editor-status", Static).render().plain
+        assert editor.is_mounted
+        assert "Could not save" in status
+        assert "Permission denied" in status
+        assert notifications == [(status, "error")]
+        assert context_path.read_bytes() == original
+        assert context_path.stat().st_mode == original_mode
+        assert not tuple(tmp_path.glob(f".{context_path.name}.*.tmp"))
+
+
+def test_sidebar_file_atomic_save_preserves_symlink_and_permissions(tmp_path: Path) -> None:
+    target = tmp_path / "actual.md"
+    target.write_text("Original.\n", encoding="utf-8")
+    target.chmod(0o640)
+    link = tmp_path / "AGENTS.md"
+    link.symlink_to(target.name)
+
+    _, snapshot = tui_app._read_sidebar_file(link)
+    tui_app._atomic_write_sidebar_file(link, "Updated.\n", snapshot)
+
+    assert link.is_symlink()
+    assert link.read_text(encoding="utf-8") == "Updated.\n"
+    assert target.stat().st_mode & 0o777 == 0o640
+    assert not tuple(tmp_path.glob(f".{target.name}.*.tmp"))
+
+
+def test_sidebar_file_atomic_save_replace_failure_keeps_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "AGENTS.md"
+    original = b"Original.\n"
+    target.write_bytes(original)
+
+    def fail_replace(source: str | Path, destination: str | Path) -> None:
+        del source, destination
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(tui_app.os, "replace", fail_replace)
+    _, snapshot = tui_app._read_sidebar_file(target)
+    with pytest.raises(OSError, match="replace failure"):
+        tui_app._atomic_write_sidebar_file(target, "Updated.\n", snapshot)
+
+    assert target.read_bytes() == original
+    assert not tuple(tmp_path.glob(f".{target.name}.*.tmp"))
+
+
+def test_sidebar_file_atomic_save_works_without_fchmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Original.\n", encoding="utf-8")
+    _, snapshot = tui_app._read_sidebar_file(target)
+    monkeypatch.delattr(tui_app.os, "fchmod", raising=False)
+
+    tui_app._atomic_write_sidebar_file(target, "Updated.\n", snapshot)
+
+    assert target.read_text(encoding="utf-8") == "Updated.\n"
 
 
 @pytest.mark.anyio
@@ -3396,6 +3940,76 @@ async def test_tui_sidebar_shows_on_left_when_configured() -> None:
         assert sidebar.display is True
         assert not app.has_class("-sidebar-right")
         assert not app.has_class("-sidebar-off")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("position", ["left", "right"])
+async def test_tui_sidebar_command_toggles_visibility_without_changing_position(
+    position: str,
+) -> None:
+    app = TauTuiApp(FakeSession(), tui_settings=TuiSettings(sidebar_position=position))
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        sidebar = app.query_one("#sidebar")
+        assert sidebar.display is True
+        assert app.has_class("-sidebar-right") is (position == "right")
+
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.value = "/sidebar"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert sidebar.display is False
+        assert app.has_class("-sidebar-right") is (position == "right")
+        assert app.tui_settings.sidebar_position == position
+
+        prompt.value = "/sidebar"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert sidebar.display is True
+        assert app.has_class("-sidebar-right") is (position == "right")
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_command_hides_user_sidebar_across_resize() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        sidebar = app.query_one("#sidebar")
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.value = "/sidebar"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert sidebar.display is False
+
+        await pilot.resize_terminal(width=80, height=30)
+        await pilot.resize_terminal(width=120, height=40)
+        await pilot.pause()
+        assert sidebar.display is False
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_off_can_be_shown_temporarily_on_right() -> None:
+    app = TauTuiApp(FakeSession(), tui_settings=TuiSettings(sidebar_position="off"))
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        sidebar = app.query_one("#sidebar")
+        assert sidebar.display is False
+        assert not app.has_class("-sidebar-right")
+
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.value = "/sidebar"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert sidebar.display is True
+        assert app.has_class("-sidebar-right")
+        assert app.tui_settings.sidebar_position == "off"
+        assert not tui_settings_path().exists()
+
+        prompt.value = "/sidebar"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert sidebar.display is False
+        assert not app.has_class("-sidebar-right")
 
 
 @pytest.mark.anyio
@@ -3654,6 +4268,36 @@ def test_tui_app_uses_light_theme_css_variables() -> None:
     assert variables["footer-description-foreground"] == "#111827"
     assert variables["footer-key-foreground"] == "#0f766e"
     assert app.current_theme.dark is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "theme",
+    [TAU_DARK_THEME, TAU_LIGHT_THEME, HIGH_CONTRAST_THEME],
+    ids=lambda theme: theme.name,
+)
+async def test_list_view_scrollbars_use_theme_colors(theme: TuiTheme) -> None:
+    app = TauTuiApp(FakeSession(), tui_settings=TuiSettings(theme=theme.name))
+
+    async with app.run_test() as pilot:
+        await app.push_screen(
+            SessionPickerScreen([], local_cwd=Path("/workspace/project"), theme=theme)
+        )
+        await pilot.pause()
+
+        list_view = app.screen.query_one("#session-picker-list", OptionList)
+
+        assert list_view.styles.scrollbar_background == Color.parse(theme.transcript_background)
+        assert list_view.styles.scrollbar_color == Color.parse(theme.border)
+        assert list_view.styles.scrollbar_background_hover == Color.parse(
+            theme.transcript_background
+        )
+        assert list_view.styles.scrollbar_color_hover == Color.parse(theme.highlight_background)
+        assert list_view.styles.scrollbar_background_active == Color.parse(
+            theme.transcript_background
+        )
+        assert list_view.styles.scrollbar_color_active == Color.parse(theme.accent)
+        assert list_view.styles.scrollbar_size_vertical == 2
 
 
 def test_tui_app_registers_only_tau_themes_with_textual() -> None:
@@ -5123,6 +5767,80 @@ async def test_tui_app_resume_command_reloads_visible_state() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_app_resume_picker_loads_other_projects_in_background() -> None:
+    local = CodingSessionRecord(
+        id="local",
+        path=Path("/workspace/project/local.jsonl"),
+        cwd=Path("/workspace/project"),
+        model="local-model",
+        title="Local session",
+        created_at=1.0,
+        updated_at=2.0,
+    )
+    other = CodingSessionRecord(
+        id="other",
+        path=Path("/elsewhere/other.jsonl"),
+        cwd=Path("/elsewhere"),
+        model="other-model",
+        title="Other session",
+        created_at=1.0,
+        updated_at=3.0,
+    )
+    local_started = threading.Event()
+    release_local = threading.Event()
+    global_started = threading.Event()
+    release_global = threading.Event()
+
+    class DelayedSessionManager:
+        def list_sessions(self, cwd: Path | None = None) -> list[CodingSessionRecord]:
+            if cwd is not None:
+                local_started.set()
+                assert release_local.wait(timeout=2)
+                return [local]
+            global_started.set()
+            assert release_global.wait(timeout=2)
+            return [other, local]
+
+    session = FakeSession()
+    session.session_manager = DelayedSessionManager()
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+
+        screen = app.screen
+        assert isinstance(screen, SessionPickerScreen)
+        assert screen.loading_other_projects is True
+        assert screen.current_project_loaded is False
+        assert screen.visible_records == ()
+        assert "Loading sessions" in str(screen.query_one("#session-picker-help", Static).render())
+        assert await asyncio.to_thread(local_started.wait, 1)
+
+        release_local.set()
+        for _ in range(20):
+            await pilot.pause()
+            if screen.current_project_loaded:
+                break
+        assert [record.id for record in screen.visible_records] == ["local"]
+        assert "Loading other projects" in str(
+            screen.query_one("#session-picker-help", Static).render()
+        )
+        assert await asyncio.to_thread(global_started.wait, 1)
+
+        release_global.set()
+        for _ in range(20):
+            await pilot.pause()
+            if not screen.loading_other_projects:
+                break
+
+        assert screen.loading_other_projects is False
+        project_list = screen.query_one("#session-picker-project-list", OptionList)
+        assert project_list.option_count == 2
+        assert [record.id for record in screen.visible_records] == ["local"]
+
+
+@pytest.mark.anyio
 async def test_tui_app_resume_command_opens_session_picker() -> None:
     record = CodingSessionRecord(
         id="session-1",
@@ -5143,9 +5861,280 @@ async def test_tui_app_resume_command_opens_session_picker() -> None:
         await pilot.press("enter")
 
         assert isinstance(app.screen, SessionPickerScreen)
-        picker_list = app.screen.query_one("#session-picker-list", ListView)
-        assert picker_list.index == 0
+        picker_list = app.screen.query_one("#session-picker-list", OptionList)
+        assert picker_list.highlighted == 0
         assert [(item.role, item.text) for item in app.state.items] == [("user", "Earlier")]
+
+
+def test_session_records_lists_local_directory_first_then_others() -> None:
+    # Records are supplied newest-first (as the real manager returns them); the
+    # picker must keep current-directory sessions ahead of every other directory.
+    records = [
+        CodingSessionRecord(
+            id="other-new",
+            path=Path("/elsewhere/new.jsonl"),
+            cwd=Path("/elsewhere"),
+            model="m",
+            title=None,
+            created_at=1.0,
+            updated_at=40.0,
+        ),
+        CodingSessionRecord(
+            id="local-new",
+            path=Path("/workspace/project/new.jsonl"),
+            cwd=Path("/workspace/project"),
+            model="m",
+            title=None,
+            created_at=1.0,
+            updated_at=30.0,
+        ),
+        CodingSessionRecord(
+            id="local-old",
+            path=Path("/workspace/project/old.jsonl"),
+            cwd=Path("/workspace/project"),
+            model="m",
+            title=None,
+            created_at=1.0,
+            updated_at=20.0,
+        ),
+        CodingSessionRecord(
+            id="other-old",
+            path=Path("/elsewhere/old.jsonl"),
+            cwd=Path("/elsewhere"),
+            model="m",
+            title=None,
+            created_at=1.0,
+            updated_at=10.0,
+        ),
+    ]
+    session = FakeSession()  # cwd == /workspace/project
+    session.session_manager = _FakeSessionManager(records)
+
+    assert [record.id for record in _session_records(session)] == [
+        "local-new",
+        "local-old",
+        "other-new",
+        "other-old",
+    ]
+
+
+def test_session_picker_label_leaves_project_context_to_project_column() -> None:
+    cwd = Path("/home/user/project")
+    record = CodingSessionRecord(
+        id="s",
+        path=cwd / "s.jsonl",
+        cwd=cwd,
+        model="gpt-5.4",
+        title="My session",
+        created_at=1.0,
+        updated_at=2.0,
+    )
+    label = _session_picker_label(record)
+
+    assert "My session" in label
+    assert _short_path(cwd) not in label
+    assert label.index(record.model) > label.index("My session")
+
+
+@pytest.mark.anyio
+async def test_session_picker_navigates_projects_in_left_column() -> None:
+    records = [
+        CodingSessionRecord(
+            id="local-1",
+            path=Path("/workspace/project/local.jsonl"),
+            cwd=Path("/workspace/project"),
+            model="m",
+            title="Local session",
+            created_at=1.0,
+            updated_at=30.0,
+        ),
+        CodingSessionRecord(
+            id="other-1",
+            path=Path("/elsewhere/other.jsonl"),
+            cwd=Path("/elsewhere"),
+            model="m",
+            title="Other session",
+            created_at=1.0,
+            updated_at=20.0,
+        ),
+    ]
+    session = FakeSession()
+    session.session_manager = _FakeSessionManager(records)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SessionPickerScreen)
+        project_list = screen.query_one("#session-picker-project-list", OptionList)
+        session_list = screen.query_one("#session-picker-list", OptionList)
+
+        project_labels = [str(option.prompt) for option in project_list.options]
+        assert project_labels == ["● project  1 session", "  elsewhere  1 session"]
+        assert [record.id for record in screen.visible_records] == ["local-1"]
+        assert str(screen.query_one("#session-picker-session-title", Static).render()) == (
+            "Recent sessions — /workspace/project"
+        )
+        assert session_list.styles.padding.left == 1
+        assert session_list.styles.padding.right == 1
+        assert screen.active_column == "sessions"
+
+        await pilot.press("left", "down")
+        await pilot.pause()
+        assert screen.active_column == "projects"
+        assert project_list.highlighted == 1
+        assert [record.id for record in screen.visible_records] == ["other-1"]
+        assert str(screen.query_one("#session-picker-session-title", Static).render()) == (
+            "Recent sessions — /elsewhere"
+        )
+        assert "Other session" in str(session_list.get_option_at_index(0).prompt)
+
+        await pilot.press("right", "enter")
+        await pilot.pause()
+        assert session.resumed_session_ids == ["other-1"]
+
+
+@pytest.mark.anyio
+async def test_session_picker_rapid_project_refresh_is_stable() -> None:
+    records = [
+        CodingSessionRecord(
+            id=f"local-{i}",
+            path=Path(f"/workspace/project/l{i}.jsonl"),
+            cwd=Path("/workspace/project"),
+            model="m",
+            title=None,
+            created_at=1.0,
+            updated_at=float(30 - i),
+        )
+        for i in range(3)
+    ]
+    session = FakeSession()
+    session.session_manager = _FakeSessionManager(records)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SessionPickerScreen)
+        picker_list = screen.query_one("#session-picker-list", OptionList)
+        for _ in range(4):
+            screen._refresh_session_list()
+            await pilot.pause()
+        assert picker_list.highlighted == 0
+        assert picker_list.option_count == len(screen.visible_records) == 3
+        # OptionList renders virtual lines instead of mounting one widget per record.
+        assert list(picker_list.children) == []
+
+
+@pytest.mark.anyio
+async def test_session_picker_first_row_highlighted_after_search_refill() -> None:
+    # After filtering to no matches and back, the first row must be current again
+    # and actually highlighted (not a stale highlight left on a removed item).
+    records = [
+        CodingSessionRecord(
+            id=f"s-{i}",
+            path=Path(f"/workspace/project/s{i}.jsonl"),
+            cwd=Path("/workspace/project"),
+            model="m",
+            title=None,
+            created_at=1.0,
+            updated_at=float(30 - i),
+        )
+        for i in range(5)
+    ]
+    session = FakeSession()  # cwd == /workspace/project
+    session.session_manager = _FakeSessionManager(records)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(60, 24)) as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/resume"
+        await pilot.press("enter")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SessionPickerScreen)
+        picker_list = screen.query_one("#session-picker-list", OptionList)
+        # Move off the first row, then filter to no matches and back.
+        await pilot.press("down")
+        assert picker_list.highlighted == 1
+        screen.search_value = "zzz-no-match"
+        screen._refresh_session_list()
+        await pilot.pause()
+        assert picker_list.highlighted is None
+        screen.search_value = ""
+        screen._refresh_session_list()
+        await pilot.pause()
+        # After the refill the first row is current again and highlighted.
+        assert picker_list.highlighted == 0
+
+
+@pytest.mark.anyio
+async def test_session_picker_column_navigation_at_boundaries_does_not_raise() -> None:
+    records = [
+        CodingSessionRecord(
+            id=f"session-{i}",
+            path=Path(f"/project-{i}/session.jsonl"),
+            cwd=Path(f"/project-{i}"),
+            model="m",
+            title=None,
+            created_at=1.0,
+            updated_at=float(30 - i),
+        )
+        for i in range(3)
+    ]
+    session = FakeSession()
+    session.session_manager = _FakeSessionManager(records)
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("ctrl+r", "left")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SessionPickerScreen)
+        project_list = screen.query_one("#session-picker-project-list", OptionList)
+        for _ in range(16):
+            screen.action_cursor_down()
+        for _ in range(16):
+            screen.action_cursor_up()
+        assert project_list.highlighted == 0
+        screen.action_focus_sessions()
+        assert screen.query_one("#session-picker-list", OptionList).highlighted is None
+
+
+@pytest.mark.anyio
+async def test_session_picker_project_click_opens_its_sessions() -> None:
+    other = CodingSessionRecord(
+        id="other-1",
+        path=Path("/elsewhere/other.jsonl"),
+        cwd=Path("/elsewhere"),
+        model="m",
+        title="Other session",
+        created_at=1.0,
+        updated_at=20.0,
+    )
+    session = FakeSession()
+    session.session_manager = _FakeSessionManager([other])
+    app = TauTuiApp(session)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SessionPickerScreen)
+        project_list = screen.query_one("#session-picker-project-list", OptionList)
+        await pilot.click(project_list, offset=Offset(2, 1))
+        await pilot.pause()
+
+        assert isinstance(app.screen, SessionPickerScreen)
+        assert screen.active_column == "sessions"
+        assert [record.id for record in screen.visible_records] == ["other-1"]
+        assert session.resumed_session_ids == []
+
+
+def test_short_path_home_directory_is_tilde() -> None:
+    assert _short_path(Path.home()) == "~"
 
 
 @pytest.mark.anyio
@@ -5186,6 +6175,35 @@ async def test_tui_app_submits_multiline_prompt_with_enter() -> None:
 
     assert session.prompt_texts == ["first\nsecond"]
     assert prompt.value == ""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("key", "hint"), [("f7", "F7"), ("ctrl+j", "Ctrl+J")])
+async def test_tui_app_uses_configured_newline_keybinding(key: str, hint: str) -> None:
+    session = FakeSession(events=[AgentStartEvent(), AgentEndEvent()])
+    app = TauTuiApp(
+        session,
+        tui_settings=TuiSettings(keybindings=TuiKeybindings(insert_newline=key)),
+    )
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "first"
+        prompt.cursor_position = len(prompt.value)
+
+        await pilot.press(key)
+
+        assert prompt.value == "first\n"
+        assert session.prompt_texts == []
+        assert f"{hint} inserts a newline" in prompt.placeholder
+        assert _visible_footer_bindings(app)["Newline"] == key
+
+        prompt.value += "second"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert session.prompt_texts == ["first\nsecond"]
+        assert prompt.value == ""
 
 
 @pytest.mark.anyio
@@ -5603,7 +6621,7 @@ async def test_tui_app_completes_registered_slash_command() -> None:
 
 
 @pytest.mark.anyio
-async def test_tui_app_enter_accepts_completion_without_submitting() -> None:
+async def test_tui_app_enter_completes_slash_then_second_enter_submits() -> None:
     app = TauTuiApp(FakeSession())
 
     async with app.run_test() as pilot:
@@ -5613,13 +6631,107 @@ async def test_tui_app_enter_accepts_completion_without_submitting() -> None:
         app._refresh_completions()
 
         await pilot.press("enter")
+        await pilot.pause()
 
         assert prompt.value == "/session"
-        assert app.state.items == []
+        assert app.session.prompt_texts == []
+        assert not isinstance(app.screen, CommandOutputScreen)
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.value == ""
+        assert isinstance(app.screen, CommandOutputScreen)
+        assert app.screen.message == "Session info"
 
 
 @pytest.mark.anyio
-async def test_tui_app_enter_accepts_arrow_selected_completion() -> None:
+async def test_tui_app_enter_submits_directly_typed_exact_slash_command() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/session"
+        app._completion_state = app._build_completion_state(prompt.value)
+        app._refresh_completions()
+
+        selected = app._completion_state.selected
+        assert selected is not None
+        assert selected.replacement == prompt.value
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.value == ""
+        assert isinstance(app.screen, CommandOutputScreen)
+        assert app.screen.message == "Session info"
+
+
+@pytest.mark.anyio
+async def test_tui_app_tab_completion_then_enter_submits() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/se"
+        app._completion_state = app._build_completion_state(prompt.value)
+        app._refresh_completions()
+
+        await pilot.press("tab")
+        assert prompt.value == "/session"
+        assert app.session.prompt_texts == []
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.value == ""
+        assert isinstance(app.screen, CommandOutputScreen)
+        assert app.screen.message == "Session info"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("raw_text", "expected_kind"),
+    (
+        ("/skill:review", CompletionKind.SKILL),
+        ("/example", CompletionKind.PROMPT_TEMPLATE),
+        ("/model fake-model", CompletionKind.ARGUMENT),
+    ),
+)
+async def test_tui_app_enter_submits_exact_non_file_completion_kinds(
+    raw_text: str,
+    expected_kind: CompletionKind,
+) -> None:
+    session = FakeSession()
+    session.prompt_templates = (
+        PromptTemplate(
+            name="example",
+            path=Path("example.md"),
+            content="Example prompt.",
+        ),
+    )
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = raw_text
+        app._completion_state = app._build_completion_state(prompt.value)
+        app._refresh_completions()
+
+        selected = app._completion_state.selected
+        assert selected is not None
+        assert selected.kind is expected_kind
+        assert app._apply_selected_completion(raw_text) == raw_text
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.value == ""
+        assert session.prompt_texts == [raw_text]
+
+
+@pytest.mark.anyio
+async def test_tui_app_enter_accepts_arrow_selected_non_file_completion() -> None:
     app = TauTuiApp(FakeSession())
 
     async with app.run_test() as pilot:
@@ -5632,9 +6744,53 @@ async def test_tui_app_enter_accepts_arrow_selected_completion() -> None:
         assert selected is not None
 
         await pilot.press("enter")
+        await pilot.pause()
 
         assert prompt.value == selected.replacement
-        assert app.state.items == []
+        assert app.session.prompt_texts == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "raw_text",
+    (
+        "inspect @main",
+        "/skill:review inspect @main",
+        "/example inspect @main",
+    ),
+)
+async def test_tui_app_enter_submits_raw_file_reference_text(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print('hi')\n", encoding="utf-8")
+
+    session = FakeSession()
+    session.cwd = tmp_path
+    session.prompt_templates = (
+        PromptTemplate(
+            name="example",
+            path=tmp_path / "example.md",
+            content="Example prompt.",
+        ),
+    )
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = raw_text
+        app._completion_state = app._build_completion_state(prompt.value)
+        app._refresh_completions()
+
+        selected = app._completion_state.selected
+        assert selected is not None
+        assert selected.kind is CompletionKind.FILE_REFERENCE
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.value == ""
+        assert session.prompt_texts == [raw_text]
 
 
 @pytest.mark.anyio
@@ -5805,14 +6961,12 @@ async def test_tui_app_session_picker_shows_human_readable_session_metadata() ->
     async with app.run_test() as pilot:
         await pilot.press("ctrl+r")
         assert isinstance(app.screen, SessionPickerScreen)
-        labels = [
-            item.query_one(Label).content
-            for item in app.screen.query_one("#session-picker-list", ListView).children
-        ]
+        session_list = app.screen.query_one("#session-picker-list", OptionList)
+        labels = [option.prompt for option in session_list.options]
 
     assert labels == [
-        "2026-06-19 14:30 - fake-model",
-        "2026-06-19 14:30 - other-model - Named work",
+        "Jun 19  fake-model",
+        "Jun 19  Named work  other-model",
     ]
     assert "session-1" not in "\n".join(str(label) for label in labels)
     assert "Untitled session" not in "\n".join(str(label) for label in labels)
@@ -5893,9 +7047,9 @@ async def test_tui_app_session_picker_search_filters_sessions() -> None:
         search.value = "search bar"
         await pilot.pause()
 
-        session_list = app.screen.query_one("#session-picker-list", ListView)
-        labels = [str(item.query_one(Label).render()) for item in session_list.children]
-        assert labels == ["2026-06-19 14:30 - other-model - Add search bar"]
+        session_list = app.screen.query_one("#session-picker-list", OptionList)
+        labels = [str(option.prompt) for option in session_list.options]
+        assert labels == ["Jun 19  Add search bar  other-model"]
 
         await pilot.press("enter")
         await pilot.pause()
@@ -5926,16 +7080,17 @@ async def test_tui_app_session_picker_search_does_not_match_workspace_path() -> 
         assert isinstance(app.screen, SessionPickerScreen)
 
         search = app.screen.query_one("#session-picker-search", Input)
-        session_list = app.screen.query_one("#session-picker-list", ListView)
+        session_list = app.screen.query_one("#session-picker-list", OptionList)
 
+        await pilot.press("left", "down", "right")
         search.value = "path-query"
         await pilot.pause()
-        assert list(session_list.children) == []
+        assert session_list.option_count == 0
 
         for query in ("model-query", "named"):
             search.value = query
             await pilot.pause()
-            assert len(session_list.children) == 1
+            assert session_list.option_count == 1
 
 
 @pytest.mark.anyio
@@ -5964,10 +7119,12 @@ async def test_tui_app_session_picker_search_with_no_matches_shows_help_text() -
         search.value = "nonexistent"
         await pilot.pause()
 
-        session_list = app.screen.query_one("#session-picker-list", ListView)
-        assert list(session_list.children) == []
+        session_list = app.screen.query_one("#session-picker-list", OptionList)
+        assert session_list.option_count == 0
         help_text = app.screen.query_one("#session-picker-help", Static)
-        assert str(help_text.render()) == "No matching sessions - Escape closes"
+        assert str(help_text.render()) == (
+            "No matching sessions - Left selects a project - Escape closes"
+        )
 
 
 @pytest.mark.anyio
@@ -6200,6 +7357,52 @@ async def test_tui_app_tree_picker_toggles_tool_calls() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_tree_labels_filter_timestamps_and_clear() -> None:
+    session = FakeSession()
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/tree"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("up", "l")
+        await pilot.pause()
+
+        field = app.screen.query_one("#extension-input-field", Input)
+        field.value = "checkpoint"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, TreePickerScreen)
+        tree_list = app.screen.query_one("#tree-picker-list", ListView)
+        labels = [str(item.query_one(Label).render()) for item in tree_list.children]
+        assert "[checkpoint] assistant: Left" in labels[2]
+        assert session.tree_label_requests == [("left", "checkpoint")]
+
+        await pilot.press("ctrl+l")
+        await pilot.pause()
+        assert "2023-11-14" in str(tree_list.children[2].query_one(Label).render())
+
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        assert len(tree_list.children) == 1
+        assert "[checkpoint]" in str(tree_list.children[0].query_one(Label).render())
+
+        await pilot.press("l")
+        await pilot.pause()
+        field = app.screen.query_one("#extension-input-field", Input)
+        assert field.value == "checkpoint"
+        field.value = ""
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, TreePickerScreen)
+        assert session.tree_label_requests == [("left", "checkpoint"), ("left", None)]
+        assert len(app.screen.query_one("#tree-picker-list", ListView).children) == 0
+
+
+@pytest.mark.anyio
 def test_completion_selected_render_line_accounts_for_group_headers() -> None:
     state = CompletionState(
         items=(
@@ -6208,6 +7411,7 @@ def test_completion_selected_render_line_accounts_for_group_headers() -> None:
                 replacement="/session",
                 start=0,
                 end=2,
+                kind=CompletionKind.COMMAND,
                 category="Commands",
             ),
             CompletionItem(
@@ -6215,6 +7419,7 @@ def test_completion_selected_render_line_accounts_for_group_headers() -> None:
                 replacement="/example",
                 start=0,
                 end=2,
+                kind=CompletionKind.PROMPT_TEMPLATE,
                 category="Custom prompts",
             ),
         ),
@@ -6232,6 +7437,7 @@ def test_visible_completion_state_keeps_selected_item_in_render_window() -> None
             replacement=f"/prompt-{index:02d}",
             start=0,
             end=1,
+            kind=CompletionKind.PROMPT_TEMPLATE,
             category="Custom prompts",
         )
         for index in range(30)
@@ -6254,6 +7460,7 @@ def test_visible_completion_state_accounts_for_wrapped_descriptions() -> None:
             replacement=f"/prompt-{index:02d}",
             start=0,
             end=1,
+            kind=CompletionKind.PROMPT_TEMPLATE,
             description=(
                 "This prompt has a long description that wraps across multiple lines "
                 "inside the completion table."
@@ -6279,6 +7486,7 @@ def test_visible_completion_state_keeps_selected_item_above_bottom_edge() -> Non
             replacement=f"/prompt-{index:02d}",
             start=0,
             end=1,
+            kind=CompletionKind.PROMPT_TEMPLATE,
             category="Custom prompts",
         )
         for index in range(30)
@@ -6655,8 +7863,22 @@ async def test_tui_app_reload_appends_command_output_to_transcript() -> None:
 @pytest.mark.anyio
 async def test_tui_app_system_appends_markdown_command_output_to_transcript() -> None:
     session = FakeSession()
-    session.system_prompt = "You are Tau.\n" + "\n".join(
-        f"Guideline {index}" for index in range(80)
+    base_prompt = "You are Tau.\n"
+    context_prompt = "\n".join(f"Guideline {index}" for index in range(80))
+    session.system_prompt = base_prompt + context_prompt
+    session.system_prompt_sources = (
+        SystemPromptSource(
+            kind="default",
+            label="Tau default prompt",
+            source="tau_coding.system_prompt",
+            content=base_prompt,
+        ),
+        SystemPromptSource(
+            kind="context",
+            label="Project instructions",
+            source="/repo/AGENTS.md",
+            content=context_prompt,
+        ),
     )
     app = TauTuiApp(session)
 
@@ -6667,16 +7889,32 @@ async def test_tui_app_system_appends_markdown_command_output_to_transcript() ->
         await pilot.pause()
 
         assert not isinstance(app.screen, CommandOutputScreen)
-        assert app.state.items == [
-            ChatItem(
-                role="status",
-                text=f"### /system\n\n{session.system_prompt}",
-                system_prompt=True,
-            )
-        ]
+        assert len(app.state.items) == 1
+        item = app.state.items[0]
+        assert item.role == "status"
+        assert item.system_prompt is True
+        assert item.text.startswith(
+            "### /system\n\n#### 01 · Tau default prompt\n\n"
+            "**Source:** `tau_coding.system_prompt`\n\nYou are Tau."
+        )
         transcript = app.query_one("#transcript", TranscriptView)
         message = transcript.query_one(TranscriptMessageWidget)
-        assert isinstance(message.query_one(ThemedMarkdownWidget), ThemedMarkdownWidget)
+        source_view = message.query_one(SystemPromptSourcesWidget)
+        sections = list(source_view.query(SystemPromptSectionWidget))
+        assert [section.source_color for section in sections] == [
+            TAU_DARK_THEME.accent,
+            TAU_DARK_THEME.role_styles["branch_summary"].border,
+        ]
+        assert sections[0].styles.background == Color.parse(
+            TAU_DARK_THEME.transcript_background
+        ).blend(Color.parse(TAU_DARK_THEME.accent), 0.08)
+        assert sections[1].styles.background == Color.parse(
+            TAU_DARK_THEME.transcript_background
+        ).blend(
+            Color.parse(TAU_DARK_THEME.role_styles["branch_summary"].border),
+            0.08,
+        )
+        assert len(list(message.query(ThemedMarkdownWidget))) == 2
 
 
 @pytest.mark.anyio
@@ -7416,6 +8654,49 @@ async def test_tui_login_subscription_opens_oauth_provider_picker() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_login_api_provider_picker_highlights_first_provider() -> None:
+    # Regression test for issue #494: the list was populated and its index set
+    # in the same pass, so the index was assigned while the list was still
+    # empty and validated back to None. Nothing was highlighted when the picker
+    # opened and the first down key skipped past the first provider.
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/login"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, LoginMethodPickerScreen)
+        app.screen.action_cursor_down()
+        app.screen.action_select_cursor()
+        await pilot.pause()
+
+        assert isinstance(app.screen, LoginProviderPickerScreen)
+        screen = app.screen
+        provider_list = screen.query_one("#login-provider-list", ListView)
+
+        # The initial refresh must highlight the first provider before the
+        # picker can receive a navigation key.
+        assert provider_list.index == 0
+        assert provider_list.highlighted_child is not None
+
+        # Drive filtering through the search input event path. The refreshed
+        # list must still highlight its first match before Down/Enter arrive.
+        search = screen.query_one("#login-provider-search", Input)
+        search.value = "moonshot"
+        await pilot.wait_for_scheduled_animations()
+        assert provider_list.index == 0
+        assert screen.visible_providers[0].name.startswith("moonshot")
+
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, LoginScreen)
+        assert app.screen.provider.name == "moonshotai-cn"
+
+
+@pytest.mark.anyio
 async def test_tui_login_api_provider_picker_filters_by_name_and_display_name() -> None:
     app = TauTuiApp(FakeSession())
 
@@ -7476,7 +8757,8 @@ async def test_tui_login_api_provider_picker_handles_no_matches() -> None:
         assert isinstance(app.screen, LoginProviderPickerScreen)
         search = app.screen.query_one("#login-provider-search", Input)
         search.value = "no-such-provider"
-        await pilot.pause()
+        # Refreshing the list awaits its mounts, so flush them before asserting.
+        await pilot.wait_for_scheduled_animations()
 
         provider_list = app.screen.query_one("#login-provider-list", ListView)
         assert len(provider_list.children) == 0
@@ -7583,10 +8865,9 @@ async def test_tui_scoped_models_picker_toggles_scoped_models_without_switching_
         await pilot.pause()
 
         assert isinstance(app.screen, ModelPickerScreen)
+        assert session.model_catalog_refresh_count == 1
         tabs = app.screen.query_one("#model-picker-tabs", Static)
-        assert str(tabs.render()) == (
-            "Scoped models setup — Enter toggles membership; active model is unchanged"
-        )
+        assert str(tabs.render()) == "Tabs: ● All models  ○ Scoped models"
         await pilot.press("enter")
         await pilot.pause()
 
@@ -7605,6 +8886,53 @@ async def test_tui_scoped_models_picker_toggles_scoped_models_without_switching_
         assert session.scoped_model_choices == ()
         assert session.provider_name == "openai"
         assert session.model == "fake-model"
+
+
+@pytest.mark.anyio
+async def test_tui_scoped_models_picker_tab_shows_only_scoped_models_for_unselect() -> None:
+    session = FakeSession()
+    session.scoped_model_choices = (
+        ModelChoice(provider_name="openai", model="fake-model"),
+        ModelChoice(provider_name="openai", model="other-model"),
+    )
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/scoped-models"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, ModelPickerScreen)
+        assert session.model_catalog_refresh_count == 1
+        await pilot.press("tab")
+        await pilot.pause()
+
+        tabs = app.screen.query_one("#model-picker-tabs", Static)
+        assert str(tabs.render()) == "Tabs: ○ All models  ● Scoped models"
+        model_list = app.screen.query_one("#model-picker-list", ListView)
+        labels = [str(item.query_one(Label).render()) for item in model_list.children]
+        assert labels == [
+            "* openai:fake-model [scoped]",
+            "  openai:other-model [scoped]",
+        ]
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert session.scoped_model_choices == (
+            ModelChoice(provider_name="openai", model="other-model"),
+        )
+        assert session.provider_name == "openai"
+        assert session.model == "fake-model"
+        labels = [str(item.query_one(Label).render()) for item in model_list.children]
+        assert labels == ["  openai:other-model [scoped]"]
+
+        await pilot.press("tab")
+        await pilot.pause()
+
+        tabs = app.screen.query_one("#model-picker-tabs", Static)
+        assert str(tabs.render()) == "Tabs: ● All models  ○ Scoped models"
 
 
 @pytest.mark.anyio
@@ -8384,6 +9712,24 @@ async def test_tui_app_cycles_scoped_model_from_keybinding() -> None:
     assert session.provider_name == "openai"
     assert session.model == "other-model"
     assert notifications == []
+
+
+@pytest.mark.anyio
+async def test_tui_app_cycles_scoped_model_backward_from_keybinding() -> None:
+    session = FakeSession()
+    session.scoped_model_choices = (
+        ModelChoice(provider_name="openai", model="fake-model"),
+        ModelChoice(provider_name="openai", model="other-model"),
+        ModelChoice(provider_name="anthropic", model="third-model"),
+    )
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+shift+p")
+        await pilot.pause()
+
+    assert session.provider_name == "anthropic"
+    assert session.model == "third-model"
 
 
 @pytest.mark.anyio

@@ -6,7 +6,8 @@ import asyncio
 import string
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from os import environ
 from pathlib import Path
 from typing import Literal
 
@@ -16,8 +17,10 @@ from tau_agent.messages import (
     AgentMessage,
     AssistantMessage,
     CustomMessage,
+    Usage,
     UserMessage,
     message_text,
+    sum_usage,
 )
 from tau_agent.provider import ModelProvider
 from tau_agent.provider_events import AssistantDoneEvent, AssistantErrorEvent, TextDeltaEvent
@@ -25,9 +28,9 @@ from tau_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
     CustomEntry,
+    CustomMessageEntry,
     JsonlSessionStorage,
     LabelEntry,
-    LeafEntry,
     MessageEntry,
     ModelChangeEntry,
     SessionInfoEntry,
@@ -41,8 +44,13 @@ from tau_agent.session.tree import SessionTreeError, path_to_entry
 from tau_agent.tool_history import ToolHistoryRepair, repair_tool_history
 from tau_agent.tools import AgentTool
 from tau_agent.types import JSONValue
+from tau_ai.model_catalog import ModelCatalogProvider, RuntimeModel, RuntimeModelCatalog
 from tau_ai.model_limits import ModelLimitsProvider, RuntimeModelLimits
 from tau_coding.branch_summary import summarize_branch_messages_with_model
+from tau_coding.codex_model_store import (
+    cached_codex_model_catalog,
+    save_codex_model_catalog,
+)
 from tau_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
 from tau_coding.context import discover_project_context_with_diagnostics
 from tau_coding.context_window import (
@@ -78,6 +86,7 @@ from tau_coding.extensions.provider_registry import DynamicProviderRegistry
 from tau_coding.extensions.providers import DynamicProvider, ProviderModel
 from tau_coding.extensions.runtime import ExtensionRuntime
 from tau_coding.models_dev_store import ModelsDevRefreshResult, refresh_models_dev_catalog
+from tau_coding.oauth import account_id_from_access_token
 from tau_coding.paths import TauPaths
 from tau_coding.project_trust import (
     CanonicalProjectPath,
@@ -95,9 +104,11 @@ from tau_coding.prompt_templates import (
     load_prompt_templates_with_diagnostics,
 )
 from tau_coding.provider_config import (
+    OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
     ProviderConfig,
     ProviderConfigError,
+    ProviderModelMetadata,
     ProviderSettings,
     load_provider_settings,
     provider_default_thinking_level,
@@ -143,7 +154,11 @@ from tau_coding.skills import Skill, expand_skill_command, load_skills_with_diag
 from tau_coding.system_prompt import (
     BuildSystemPromptOptions,
     ProjectContextFile,
+    PromptSection,
+    SystemPromptInspection,
+    SystemPromptSource,
     build_system_prompt,
+    build_system_prompt_inspection,
 )
 from tau_coding.thinking import (
     DEFAULT_THINKING_LEVEL,
@@ -245,6 +260,8 @@ class SessionTreeChoice:
     label: str
     active: bool = False
     is_tool_call: bool = False
+    bookmark_label: str | None = None
+    label_timestamp: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +290,7 @@ class SessionResources:
     custom_system_prompt: str | None
     custom_system_prompt_path: Path | None
     append_system_prompt: str | None
+    append_system_prompts: tuple[str, ...]
     append_system_prompt_paths: tuple[Path, ...]
     diagnostics: tuple[ResourceDiagnostic, ...]
 
@@ -281,8 +299,20 @@ class SessionResources:
 class CompactionPlan:
     """Prepared active-context entries for a compaction run."""
 
-    replace_entry_ids: tuple[str, ...]
+    first_kept_entry_id: str
+    replaced_entry_count: int
     messages_to_summarize: tuple[AgentMessage, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _GeneratedSummary:
+    """Summary text paired with the provider usage spent producing it."""
+
+    text: str
+    usage: Usage | None
+    provider: str | None = None
+    model: str | None = None
+    response_provider: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,11 +328,10 @@ class ManualCompactionResult:
 
 @dataclass(frozen=True, slots=True)
 class _PendingMessageWrite:
-    """Stable entries retained while a message persistence attempt is retried."""
+    """Stable entry retained while a message persistence attempt is retried."""
 
     message: AgentMessage
-    message_entry: MessageEntry
-    leaf_entry: LeafEntry
+    entry: MessageEntry | CustomMessageEntry
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,12 +358,21 @@ class CodingSessionConfig:
     requested_model: str | None = None
     session_provider_name: str | None = None
     provider_settings: ProviderSettings | None = None
+    runtime_model_catalogs: Mapping[str, RuntimeModelCatalog] = field(default_factory=dict)
     runtime_provider_config: ProviderConfig | None = None
     dynamic_provider: DynamicProvider | None = None
     owns_initial_provider: bool = False
     auto_compact_token_threshold: int | None = None
     auto_compact_enabled: bool = True
     thinking_level: ThinkingLevel = DEFAULT_THINKING_LEVEL
+    thinking_level_override: ThinkingLevel | None = None
+    """One-shot startup override (e.g. ``--thinking``) for the session's level.
+
+    Takes precedence over remembered per-model defaults and replayed session
+    state, is validated strictly against the active model's available levels
+    when the provider configuration is known, and is never persisted as a new
+    remembered default.
+    """
     index_on_first_persist: bool = False
     shell_command_prefix: str | None = None
     skills_enabled: bool = True
@@ -385,6 +423,7 @@ class CodingSession:
         custom_system_prompt: str | None = None,
         custom_system_prompt_path: Path | None = None,
         append_system_prompt: str | None = None,
+        append_system_prompts: tuple[str, ...] = (),
         append_system_prompt_paths: tuple[Path, ...] = (),
         resource_diagnostics: tuple[ResourceDiagnostic, ...] = (),
         command_registry: CommandRegistry | None = None,
@@ -409,6 +448,7 @@ class CodingSession:
         self._custom_system_prompt = custom_system_prompt
         self._custom_system_prompt_path = custom_system_prompt_path
         self._append_system_prompt = append_system_prompt
+        self._append_system_prompts = append_system_prompts
         self._append_system_prompt_paths = append_system_prompt_paths
         self._resource_diagnostics = resource_diagnostics
         self._command_registry = command_registry or create_default_command_registry()
@@ -418,6 +458,9 @@ class CodingSession:
             "fixed" if config.inference_provider is not None else "automatic"
         )
         self._provider_settings = config.provider_settings
+        self._durable_provider_settings = config.provider_settings
+        self._runtime_model_catalogs = dict(config.runtime_model_catalogs)
+        self._model_catalog_discovery_errors: dict[str, str] = {}
         self._runtime_provider_config = config.runtime_provider_config
         self._resource_paths = resource_paths_with_cwd(config.resource_paths, config.cwd)
         self._auto_compact_token_threshold = config.auto_compact_token_threshold
@@ -467,13 +510,7 @@ class CodingSession:
         else:
             entries = _detach_missing_parents(entries)
 
-        linear_state = SessionState.from_entries(entries)
-        latest_leaf = _latest_leaf_entry(entries)
-        state = (
-            SessionState.from_entries(entries, leaf_id=latest_leaf.entry_id)
-            if latest_leaf is not None
-            else linear_state
-        )
+        state = SessionState.from_entries(entries)
         unfiltered_resource_paths = resource_paths_with_cwd(config.resource_paths, config.cwd)
 
         # A runtime is cwd-bound because it may contain project registrations.
@@ -566,16 +603,68 @@ class CodingSession:
                 include_user_dir=False,
             )
 
-        if config.provider is None:
+        runtime_model_catalogs = dict(config.runtime_model_catalogs)
+        if config.provider_settings is not None and "openai-codex" not in runtime_model_catalogs:
+            codex_config = _provider_config_or_none(config.provider_settings, "openai-codex")
+            if isinstance(codex_config, OpenAICodexProviderConfig):
+                account_id = _codex_account_id(codex_config, credential_store)
+                cached_catalog = cached_codex_model_catalog(
+                    runtime_paths,
+                    account_id=account_id,
+                )
+                if cached_catalog is not None:
+                    runtime_model_catalogs["openai-codex"] = cached_catalog
+        config = replace(config, runtime_model_catalogs=runtime_model_catalogs)
+        selection_settings = _provider_settings_with_runtime_catalogs(
+            config.provider_settings,
+            runtime_model_catalogs,
+        )
+        selected_provider_name = (
+            config.requested_provider or state.provider or config.session_provider_name
+        )
+        selected_model = config.requested_model or state.model
+        rediscover_codex = False
+        if selected_provider_name == "openai-codex" and config.provider_settings is not None:
+            selected_config = _provider_config_or_none(
+                config.provider_settings,
+                selected_provider_name,
+            )
+            rediscover_codex = (
+                isinstance(selected_config, OpenAICodexProviderConfig)
+                and selected_model not in selected_config.models
+            )
+        preparation_settings = config.provider_settings
+        startup_catalog: RuntimeModelCatalog | None = None
+        effective_selected_config = (
+            _provider_config_or_none(selection_settings, selected_provider_name)
+            if selection_settings is not None
+            else None
+        )
+        if (
+            isinstance(effective_selected_config, OpenAICodexProviderConfig)
+            and selected_model in effective_selected_config.models
+        ):
+            preparation_settings = selection_settings
+        if config.provider is None or rediscover_codex:
             prepared = await _prepare_provider_selection(
-                config,
+                replace(config, provider_settings=preparation_settings),
                 state=state,
                 provider_registry=extension_runtime.provider_registry,
                 credential_store=credential_store,
             )
+            if config.provider is not None and config.owns_initial_provider:
+                try:
+                    await config.provider.aclose()  # type: ignore[attr-defined]
+                except BaseException:
+                    await prepared.provider.aclose()
+                    raise
+            startup_catalog = prepared.runtime_model_catalog
+            if startup_catalog is not None:
+                runtime_model_catalogs[prepared.provider_name] = startup_catalog
             config = replace(
                 config,
                 provider=prepared.provider,
+                runtime_model_catalogs=runtime_model_catalogs,
                 model=prepared.model,
                 provider_name=prepared.provider_name,
                 inference_provider=prepared.inference_provider,
@@ -593,6 +682,9 @@ class CodingSession:
                     else entry
                     for entry in pending_initial_entries
                 )
+                # Initial fallback metadata was created before live discovery.
+                # Replay the corrected entries so runtime and durable selection agree.
+                state = SessionState.from_entries(list(pending_initial_entries))
         assert config.provider is not None
         active_model = _runtime_model_for_state(config, state)
         image_support = ImageSupportState(
@@ -621,13 +713,18 @@ class CodingSession:
                         if config.custom_system_prompt is not None
                         else resources.custom_system_prompt
                     ),
-                    append_system_prompt=_compose_append_system_prompt(
-                        resources.append_system_prompt,
+                    append_sections=_append_prompt_sections(
+                        resources.append_system_prompts,
+                        resources.append_system_prompt_paths,
                         config.append_system_prompt,
                     ),
                     context_files=resources.context_files,
                     extra_guidelines=extension_runtime.prompt_guidelines,
-                    extra_sections=extension_runtime.prompt_sections,
+                    extra_sections=extension_runtime.sourced_prompt_sections,
+                    custom_prompt_source=_custom_prompt_source(
+                        explicit=config.custom_system_prompt is not None,
+                        path=resources.custom_system_prompt_path,
+                    ),
                 )
             )
         )
@@ -654,6 +751,7 @@ class CodingSession:
             custom_system_prompt=resources.custom_system_prompt,
             custom_system_prompt_path=resources.custom_system_prompt_path,
             append_system_prompt=resources.append_system_prompt,
+            append_system_prompts=resources.append_system_prompts,
             append_system_prompt_paths=resources.append_system_prompt_paths,
             resource_diagnostics=resources.diagnostics,
             command_registry=config.command_registry or extension_runtime.build_command_registry(),
@@ -666,9 +764,21 @@ class CodingSession:
             # Ownership starts before any repair/discovery work so every
             # failure path has exactly one closer for the candidate.
             session._owned_providers.append(config.provider)  # type: ignore[arg-type]
+        if startup_catalog is not None and config.provider_name == "openai-codex":
+            session._persist_codex_model_catalog(
+                config.provider,
+                startup_catalog,
+                (
+                    config.runtime_provider_config
+                    if isinstance(config.runtime_provider_config, OpenAICodexProviderConfig)
+                    else None
+                ),
+            )
         await session._persist_active_tool_history_repairs()
-        session._sync_thinking_level_to_active_model()
         try:
+            session._apply_runtime_model_catalogs()
+            session._apply_thinking_level_override()
+            session._sync_thinking_level_to_active_model()
             if not config.owns_initial_provider and config.provider is not None:
                 session._refresh_runtime_provider()
             await session._refresh_runtime_model_limits()
@@ -856,16 +966,39 @@ class CodingSession:
         """Return branchable session entries for a tree picker."""
         entries = await self._read_session_entries()
         branch_indents = _tree_branch_indents(entries)
+        labels_by_id, label_timestamps_by_id = _resolved_labels(entries)
+        active_choice_id = _active_branchable_entry_id(entries, self._state.active_leaf_id)
         return tuple(
             SessionTreeChoice(
                 entry_id=entry.id,
                 label=_tree_choice_label(entry, branch_indent=branch_indents.get(entry.id, 0)),
-                active=entry.id == self._state.active_leaf_id,
+                active=entry.id == active_choice_id,
                 is_tool_call=_is_tool_call_tree_entry(entry),
+                bookmark_label=labels_by_id.get(entry.id),
+                label_timestamp=label_timestamps_by_id.get(entry.id),
             )
             for entry in _ordered_tree_entries(entries)
             if _is_branchable_tree_entry(entry)
         )
+
+    async def set_label(self, target_id: str, label: str | None) -> LabelEntry:
+        """Set or clear the bookmark on an existing session entry."""
+        if self._harness.is_running:
+            raise RuntimeError(TREE_RUNNING_MESSAGE)
+        await self._flush_pending_message_writes(context=self._diagnostic_context())
+        entries = await self._read_session_entries()
+        if target_id not in {entry.id for entry in entries}:
+            raise ValueError(f"Unknown session entry: {target_id}")
+        normalized = label.strip() if label is not None else ""
+        entry = LabelEntry(
+            parent_id=self._last_parent_id,
+            target_id=target_id,
+            label=normalized or None,
+        )
+        await self._append_session_entry(entry)
+        self._last_parent_id = entry.id
+        await self._refresh_persisted_state(leaf_id=entry.id)
+        return entry
 
     async def branch_to_entry(
         self,
@@ -897,7 +1030,7 @@ class CodingSession:
                 self._last_parent_id,
             )
             if abandoned_messages:
-                summary = await self._summarize_branch_messages(
+                generated = await self._summarize_branch_messages(
                     abandoned_messages,
                     custom_instructions=custom_instructions,
                     replace_instructions=replace_instructions,
@@ -905,7 +1038,11 @@ class CodingSession:
                 summary_entry = BranchSummaryEntry(
                     parent_id=entry_id,
                     branch_root_id=entry_id,
-                    summary=summary,
+                    summary=generated.text,
+                    usage=generated.usage,
+                    provider=generated.provider,
+                    model=generated.model,
+                    response_provider=generated.response_provider,
                 )
                 await self._append_session_entry(summary_entry)
                 target_id = summary_entry.id
@@ -913,10 +1050,10 @@ class CodingSession:
             target_id = selected_entry.parent_id
             input_prefill = selected_entry.message.text
 
-        leaf = LeafEntry(parent_id=target_id, entry_id=target_id)
-        await self._append_session_entry(leaf)
         self._last_parent_id = target_id
 
+        # Plain navigation is in-memory only. A summary above is the sole write,
+        # and becomes the file-order tip when present.
         await self._refresh_persisted_state(leaf_id=target_id)
         history_repair = await self._persist_active_tool_history_repairs()
         if history_repair is None:
@@ -1062,6 +1199,59 @@ class CodingSession:
     def system_prompt(self) -> str:
         """Return the effective system prompt sent to the model."""
         return self._harness.config.system
+
+    @property
+    def system_prompt_inspection(self) -> SystemPromptInspection:
+        """Return the effective prompt with source attribution for local inspection."""
+        if self._config.system is not None:
+            return SystemPromptInspection(
+                text=self.system_prompt,
+                sources=(
+                    SystemPromptSource(
+                        kind="system",
+                        label="System prompt override",
+                        source="CodingSessionConfig.system",
+                        content=self.system_prompt,
+                    ),
+                ),
+            )
+        inspection = build_system_prompt_inspection(
+            BuildSystemPromptOptions(
+                cwd=self.cwd,
+                tools=self.tools,
+                skills=self.skills,
+                custom_prompt=(
+                    self._config.custom_system_prompt
+                    if self._config.custom_system_prompt is not None
+                    else self._custom_system_prompt
+                ),
+                append_sections=_append_prompt_sections(
+                    self._append_system_prompts,
+                    self._append_system_prompt_paths,
+                    self._config.append_system_prompt,
+                ),
+                context_files=self.context_files,
+                extra_guidelines=self._extension_runtime.prompt_guidelines,
+                extra_sections=self._extension_runtime.sourced_prompt_sections,
+                custom_prompt_source=_custom_prompt_source(
+                    explicit=self._config.custom_system_prompt is not None,
+                    path=self._custom_system_prompt_path,
+                ),
+            )
+        )
+        if inspection.text == self.system_prompt:
+            return inspection
+        return SystemPromptInspection(
+            text=self.system_prompt,
+            sources=(
+                SystemPromptSource(
+                    kind="runtime",
+                    label="Effective system prompt",
+                    source="active Tau session (runtime-composed)",
+                    content=self.system_prompt,
+                ),
+            ),
+        )
 
     @property
     def auto_compact_token_threshold(self) -> int | None:
@@ -1242,8 +1432,6 @@ class CodingSession:
         entry = CustomEntry(parent_id=self._last_parent_id, namespace=namespace, data=data)
         await self._append_session_entry(entry)
         self._last_parent_id = entry.id
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_entry(leaf)
         await self._refresh_persisted_state(leaf_id=entry.id)
 
     @property
@@ -1383,8 +1571,7 @@ class CodingSession:
             model=model,
             provider=self.provider_name,
         )
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_batch((entry, leaf))
+        await self._append_session_entry(entry)
         self._last_parent_id = entry.id
         await self._refresh_persisted_state(leaf_id=entry.id)
 
@@ -1392,7 +1579,7 @@ class CodingSession:
         """Switch provider/model with candidate-first durable publication.
 
         No active state changes until the candidate runtime exists and the
-        provider-aware model entry plus leaf are committed as one batch.
+        provider-aware model entry is committed.
         """
         if self._harness.is_running:
             raise RuntimeError(
@@ -1474,8 +1661,7 @@ class CodingSession:
                 model=choice.model,
                 provider=choice.provider_name,
             )
-            leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-            await self._append_session_batch((entry, leaf))
+            await self._append_session_entry(entry)
         except BaseException:
             if candidate is not None:
                 await candidate.aclose()
@@ -1573,6 +1759,7 @@ class CodingSession:
             raise ProviderConfigError("Provider settings are not available for this session")
         available = set(self.available_model_choices)
         existing = choice in self.scoped_model_choices
+        durable_settings = getattr(self, "_durable_provider_settings", self._provider_settings)
         effective = self._provider_registry.effective(choice.provider_name)
         if effective is not None and isinstance(effective.definition, DynamicProvider):
             if not (
@@ -1592,14 +1779,28 @@ class CodingSession:
                 raise ProviderConfigError(
                     f"Model is not available: {choice.provider_name}:{choice.model}"
                 )
-            toggle = toggle_saved_scoped_model
+            durable_provider = (
+                durable_settings.get_provider(choice.provider_name)
+                if durable_settings is not None
+                else None
+            )
+            toggle = (
+                toggle_saved_scoped_model
+                if durable_provider is not None and choice.model in durable_provider.models
+                else toggle_saved_stable_scoped_model
+            )
 
-        self._provider_settings = toggle(
+        updated_settings = toggle(
             provider_name=choice.provider_name,
             model=choice.model,
             paths=self._resource_paths.paths,
-            fallback_settings=self._provider_settings,
+            fallback_settings=durable_settings,
         )
+        if hasattr(self, "_durable_provider_settings"):
+            self._durable_provider_settings = updated_settings
+            self._apply_runtime_model_catalogs()
+        else:  # narrowly supports lightweight host/test session doubles
+            self._provider_settings = updated_settings
         self._sync_thinking_level_to_active_model()
         return self.scoped_model_choices
 
@@ -1714,8 +1915,6 @@ class CodingSession:
             thinking_level=normalized,
         )
         await self._append_session_entry(entry)
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_entry(leaf)
         self._last_parent_id = entry.id
 
         self._persist_thinking_level_choice()
@@ -1736,9 +1935,56 @@ class CodingSession:
         if self._provider_settings is None:
             return None
         try:
-            return self._provider_settings.get_provider(self._provider_name)
+            provider = self._provider_settings.get_provider(self._provider_name)
         except ProviderConfigError:
             return None
+        runtime = self._runtime_provider_config
+        if (
+            isinstance(provider, OpenAICodexProviderConfig)
+            and self.model not in provider.models
+            and runtime is not None
+            and runtime.name == provider.name
+            and self.model in runtime.models
+        ):
+            # Picker visibility must not invalidate an already selected runtime.
+            return runtime
+        return provider
+
+    def _apply_thinking_level_override(self) -> None:
+        """Apply the one-shot startup thinking override to the loaded session.
+
+        Runs once during :meth:`load`, after session state is replayed and
+        before the level is synced to the active model, so the override wins
+        over both remembered defaults and the resumed transcript state. The
+        override is validated strictly against either the active dynamic model
+        or the durable provider configuration when its capabilities are known.
+        """
+        override = self._config.thinking_level_override
+        if override is None:
+            return
+        dynamic = self._active_dynamic_provider
+        if dynamic is not None:
+            model = self._active_dynamic_model
+            levels = model.thinking_levels if model is not None else None
+            if not levels:
+                raise ProviderConfigError(
+                    f"Thinking modes are unavailable for {dynamic.id}:{self.model}"
+                )
+            if override not in levels:
+                allowed = ", ".join(levels)
+                raise ProviderConfigError(
+                    f'Thinking mode "{override}" is not available for '
+                    f"{dynamic.id}:{self.model}. Available modes: {allowed}"
+                )
+            self._thinking_level = override
+            return
+        provider = self._active_provider_config()
+        if provider is None:
+            self._thinking_level = override
+            return
+        resolved = resolve_startup_thinking_level(provider, self.model, cli_override=override)
+        if resolved is not None:
+            self._thinking_level = resolved
 
     def _sync_thinking_level_to_active_model(self) -> None:
         provider = self._active_provider_config()
@@ -1758,14 +2004,19 @@ class CodingSession:
         )
 
     def _persist_default_model_choice(self) -> None:
-        if self._provider_settings is None:
+        if self._durable_provider_settings is None:
             return
-        self._provider_settings = save_default_provider_model(
+        durable_provider = self._durable_provider_settings.get_provider(self.provider_name)
+        if self.model not in durable_provider.models:
+            # Account-specific inventory is deliberately not written into catalog.toml.
+            return
+        self._durable_provider_settings = save_default_provider_model(
             provider_name=self.provider_name,
             model=self.model,
             paths=self._resource_paths.paths,
-            fallback_settings=self._provider_settings,
+            fallback_settings=self._durable_provider_settings,
         )
+        self._apply_runtime_model_catalogs()
         self._sync_thinking_level_to_active_model()
 
     def _persist_thinking_level_choice(self) -> None:
@@ -1778,13 +2029,14 @@ class CodingSession:
         ):
             return
         try:
-            self._provider_settings = save_provider_thinking_level(
+            self._durable_provider_settings = save_provider_thinking_level(
                 provider_name=self.provider_name,
                 model=self.model,
                 thinking_level=self._thinking_level,
                 paths=self._resource_paths.paths,
-                fallback_settings=self._provider_settings,
+                fallback_settings=self._durable_provider_settings,
             )
+            self._apply_runtime_model_catalogs()
         except ProviderConfigError:
             return
 
@@ -1992,12 +2244,30 @@ class CodingSession:
         self._runtime_model_limits_key = key
         self._model_limits_discovery_error = None
         provider = self._harness.config.provider
-        if not isinstance(provider, ModelLimitsProvider):
+        if (
+            self.provider_name == "openai-codex"
+            and isinstance(provider, ModelCatalogProvider)
+            and environ.get("TAU_OFFLINE") is not None
+        ):
             return
         try:
-            self._runtime_model_limits = await provider.discover_model_limits(self.model)
+            cached_catalog = self._runtime_model_catalogs.get(self.provider_name)
+            if self.provider_name == "openai-codex" and cached_catalog is not None:
+                model = cached_catalog.model(self.model)
+                self._runtime_model_limits = model.limits if model is not None else None
+                return
+            if isinstance(provider, ModelCatalogProvider):
+                catalog = await provider.discover_models()
+                self._publish_runtime_model_catalog(self.provider_name, catalog)
+                if self.provider_name == "openai-codex":
+                    self._persist_codex_model_catalog(provider, catalog)
+            if isinstance(provider, ModelLimitsProvider):
+                self._runtime_model_limits = await provider.discover_model_limits(self.model)
         except Exception as exc:  # noqa: BLE001 - static catalog remains the safe fallback
-            self._model_limits_discovery_error = f"{type(exc).__name__}: {exc}"
+            error = f"{type(exc).__name__}: {exc}"
+            self._model_limits_discovery_error = error
+            if isinstance(provider, ModelCatalogProvider):
+                self._model_catalog_discovery_errors[self.provider_name] = error
 
     async def reload(self) -> CodingReloadSummary:
         """Stage and atomically publish a complete replacement snapshot."""
@@ -2017,7 +2287,7 @@ class CodingSession:
         before_extensions = _extension_signatures(self._extension_runtime)
         before_tool_names = tuple(tool.name for tool in self._harness.config.tools)
         before_guidelines = self._extension_runtime.prompt_guidelines
-        before_sections = self._extension_runtime.prompt_sections
+        before_sections = self._extension_runtime.sourced_prompt_sections
 
         # Nothing below mutates the live session. Eligible extensions are loaded
         # first so project code cannot import before the destination decision.
@@ -2120,7 +2390,7 @@ class CodingSession:
             append_system_prompt_paths=resources.append_system_prompt_paths,
         )
         after_guidelines = staged_runtime.prompt_guidelines
-        after_sections = staged_runtime.prompt_sections
+        after_sections = staged_runtime.sourced_prompt_sections
         system_prompt_rebuilt = self._config.system is None and (
             before_system_prompt_inputs != after_system_prompt_inputs
             or before_tool_names != tuple(tool.name for tool in staged_tools)
@@ -2139,13 +2409,18 @@ class CodingSession:
                         if self._config.custom_system_prompt is not None
                         else resources.custom_system_prompt
                     ),
-                    append_system_prompt=_compose_append_system_prompt(
-                        resources.append_system_prompt,
+                    append_sections=_append_prompt_sections(
+                        resources.append_system_prompts,
+                        resources.append_system_prompt_paths,
                         self._config.append_system_prompt,
                     ),
                     context_files=resources.context_files,
                     extra_guidelines=after_guidelines,
                     extra_sections=after_sections,
+                    custom_prompt_source=_custom_prompt_source(
+                        explicit=self._config.custom_system_prompt is not None,
+                        path=resources.custom_system_prompt_path,
+                    ),
                 )
             )
 
@@ -2179,6 +2454,7 @@ class CodingSession:
         self._custom_system_prompt = resources.custom_system_prompt
         self._custom_system_prompt_path = resources.custom_system_prompt_path
         self._append_system_prompt = resources.append_system_prompt
+        self._append_system_prompts = resources.append_system_prompts
         self._append_system_prompt_paths = resources.append_system_prompt_paths
         self._resource_diagnostics = resources.diagnostics
         self._command_registry = staged_commands
@@ -2212,27 +2488,127 @@ class CodingSession:
         )
 
     async def refresh_model_catalogs(self, *, force: bool = False) -> ModelsDevRefreshResult:
-        """Refresh the persisted remote catalog and publish it to this session."""
-        result = await refresh_models_dev_catalog(
-            paths=self._resource_paths.paths,
-            force=force,
-        )
-        self.reload_provider_settings()
+        """Refresh public and authenticated catalogs and publish them to this session."""
+        public_error: Exception | None = None
+        result: ModelsDevRefreshResult | None = None
+        try:
+            result = await refresh_models_dev_catalog(
+                paths=self._resource_paths.paths,
+                force=force,
+            )
+            self.reload_provider_settings()
+        except Exception as error:  # noqa: BLE001 - authenticated refresh still runs
+            public_error = error
+        await self._refresh_codex_model_catalog()
+        if public_error is not None:
+            raise public_error
+        assert result is not None
         return result
+
+    async def _refresh_codex_model_catalog(self) -> None:
+        """Refresh the account-specific Codex inventory without making it durable."""
+        if environ.get("TAU_OFFLINE") is not None or self._durable_provider_settings is None:
+            return
+        try:
+            provider_config = self._durable_provider_settings.get_provider("openai-codex")
+        except ProviderConfigError:
+            return
+        if not isinstance(provider_config, OpenAICodexProviderConfig):
+            return
+        if not self._provider_is_usable(provider_config):
+            return
+
+        # Use a fresh provider even when Codex is active. The active provider caches
+        # its startup snapshot so reusing it would make `/model` unable to discover
+        # versions or models released during a long-running Tau process.
+        temporary_provider = create_model_provider(
+            provider_config,
+            credential_store=self._credential_store,
+            model=None,
+            thinking_level=None,
+        )
+        if not isinstance(temporary_provider, ModelCatalogProvider):
+            await temporary_provider.aclose()
+            return
+        try:
+            catalog = await temporary_provider.discover_models()
+            self._publish_runtime_model_catalog(provider_config.name, catalog)
+            self._persist_codex_model_catalog(temporary_provider, catalog, provider_config)
+        except Exception as exc:  # noqa: BLE001 - static catalog remains the safe fallback
+            self._model_catalog_discovery_errors[provider_config.name] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            await temporary_provider.aclose()
+
+    def _persist_codex_model_catalog(
+        self,
+        provider: object,
+        catalog: RuntimeModelCatalog,
+        provider_config: OpenAICodexProviderConfig | None = None,
+    ) -> None:
+        config = provider_config or (
+            self._runtime_provider_config
+            if isinstance(self._runtime_provider_config, OpenAICodexProviderConfig)
+            else None
+        )
+        if config is None:
+            return
+        account_id = getattr(provider, "account_id", None) or _codex_account_id(
+            config,
+            self._credential_store,
+        )
+        if not isinstance(account_id, str) or not account_id:
+            return
+        with suppress(OSError, TypeError, ValueError):
+            save_codex_model_catalog(
+                catalog,
+                account_id=account_id,
+                paths=self._resource_paths.paths,
+            )
+
+    def _publish_runtime_model_catalog(
+        self,
+        provider_name: str,
+        catalog: RuntimeModelCatalog,
+    ) -> None:
+        if not catalog.models:
+            raise ValueError("provider returned an empty model catalog")
+        self._runtime_model_catalogs[provider_name] = catalog
+        self._model_catalog_discovery_errors.pop(provider_name, None)
+        self._invalidate_runtime_model_limits()
+        self._apply_runtime_model_catalogs()
+
+    def _apply_runtime_model_catalogs(self) -> None:
+        settings = self._durable_provider_settings
+        if settings is None:
+            self._provider_settings = None
+            return
+        providers = tuple(
+            _provider_with_runtime_model_catalog(
+                provider,
+                self._runtime_model_catalogs.get(provider.name),
+            )
+            for provider in settings.providers
+        )
+        self._provider_settings = replace(settings, providers=providers)
 
     def reload_provider_settings(self) -> None:
         """Reload provider settings for login and model-selection flows."""
         if self._provider_settings is None:
             return
         previous_settings = self._provider_settings
+        previous_durable_settings = self._durable_provider_settings
         previous_thinking_level = self._thinking_level
-        self._provider_settings = load_provider_settings(self._resource_paths.paths)
+        self._durable_provider_settings = load_provider_settings(self._resource_paths.paths)
+        self._apply_runtime_model_catalogs()
         try:
             self._sync_thinking_level_to_active_model()
             self._refresh_runtime_provider()
             self._sync_image_support()
         except ProviderConfigError:
             self._provider_settings = previous_settings
+            self._durable_provider_settings = previous_durable_settings
             self._thinking_level = previous_thinking_level
             raise
 
@@ -2284,7 +2660,15 @@ class CodingSession:
                         dynamic_resume = True
                         runtime_provider_config = None
                     else:
-                        validate_provider_model(runtime_provider_config, model)
+                        if (
+                            isinstance(runtime_provider_config, OpenAICodexProviderConfig)
+                            and model not in runtime_provider_config.models
+                        ):
+                            # Re-discover a live-only destination model before validation.
+                            dynamic_resume = True
+                            runtime_provider_config = None
+                        else:
+                            validate_provider_model(runtime_provider_config, model)
 
         replacement = await type(self).load(
             CodingSessionConfig(
@@ -2306,7 +2690,7 @@ class CodingSession:
                 requested_provider=provider_name if dynamic_resume else None,
                 requested_model=model if dynamic_resume else None,
                 session_provider_name=record.provider_name,
-                provider_settings=self._provider_settings,
+                provider_settings=self._durable_provider_settings,
                 runtime_provider_config=runtime_provider_config,
                 auto_compact_token_threshold=self._auto_compact_token_threshold,
                 auto_compact_enabled=self._auto_compact_enabled,
@@ -2327,9 +2711,10 @@ class CodingSession:
             )
         )
         try:
-            if restore_record_model and runtime_provider_config is not None:
-                validate_provider_model(runtime_provider_config, replacement.model)
-            else:
+            if not restore_record_model:
+                # Only provider-less legacy records inherit the source model.
+                # The staged loader has already resolved provider-aware records
+                # against the destination's (possibly freshly discovered) catalog.
                 replacement._harness.config.model = self.model
                 replacement._sync_thinking_level_to_active_model()
                 replacement._refresh_runtime_provider()
@@ -2464,7 +2849,7 @@ class CodingSession:
                 requested_provider=provider_name if dynamic_provider is not None else None,
                 requested_model=model if dynamic_provider is not None else None,
                 session_provider_name=provider_name,
-                provider_settings=self._provider_settings,
+                provider_settings=self._durable_provider_settings,
                 runtime_provider_config=runtime_provider_config,
                 dynamic_provider=dynamic_provider,
                 owns_initial_provider=dynamic_provider is not None,
@@ -2534,6 +2919,7 @@ class CodingSession:
         self._custom_system_prompt = replacement._custom_system_prompt
         self._custom_system_prompt_path = replacement._custom_system_prompt_path
         self._append_system_prompt = replacement._append_system_prompt
+        self._append_system_prompts = replacement._append_system_prompts
         self._append_system_prompt_paths = replacement._append_system_prompt_paths
         self._resource_diagnostics = replacement._resource_diagnostics
         self._command_registry = replacement._command_registry
@@ -2541,6 +2927,9 @@ class CodingSession:
         self._inference_provider = replacement._inference_provider
         self._inference_provider_mode = replacement._inference_provider_mode
         self._provider_settings = replacement._provider_settings
+        self._durable_provider_settings = replacement._durable_provider_settings
+        self._runtime_model_catalogs = replacement._runtime_model_catalogs
+        self._model_catalog_discovery_errors = replacement._model_catalog_discovery_errors
         self._runtime_provider_config = replacement._runtime_provider_config
         self._resource_paths = replacement._resource_paths
         self._auto_compact_token_threshold = replacement._auto_compact_token_threshold
@@ -2572,44 +2961,35 @@ class CodingSession:
     async def compact_detailed(self, instructions: str | None = None) -> ManualCompactionResult:
         """Compact older context while preserving a real recent-entry boundary."""
         await self._flush_pending_message_writes(context=self._diagnostic_context())
-        rows = self._active_context_rows()
         plan = self._recent_preserving_compaction_plan()
         if plan is None:
             raise ValueError("Not enough context to compact while preserving recent entries")
-        first_kept_entry_id = rows[len(plan.replace_entry_ids)][0]
         tokens_before = self.context_token_estimate
-        summary = await self._generate_compaction_summary(
+        generated = await self._generate_compaction_summary(
             plan.messages_to_summarize,
             custom_instructions=instructions,
         )
-        compaction = await self._append_compaction(
-            summary,
-            replace_entry_ids=plan.replace_entry_ids,
-            first_kept_entry_id=first_kept_entry_id,
+        await self._append_compaction(
+            generated.text,
+            first_kept_entry_id=plan.first_kept_entry_id,
             tokens_before=tokens_before,
+            usage=generated.usage,
+            provider=generated.provider,
+            model=generated.model,
+            response_provider=generated.response_provider,
         )
         return ManualCompactionResult(
-            summary=summary,
-            first_kept_entry_id=first_kept_entry_id,
+            summary=generated.text,
+            first_kept_entry_id=plan.first_kept_entry_id,
             tokens_before=tokens_before,
             estimated_tokens_after=self.context_token_estimate,
-            replaced_entry_count=len(compaction.replaces_entry_ids),
+            replaced_entry_count=plan.replaced_entry_count,
         )
 
     async def compact(self, instructions: str | None = None) -> str:
         """Generate a manual compaction summary and rebuild active context."""
-        await self._flush_pending_message_writes(context=self._diagnostic_context())
-        plan = self._manual_compaction_plan()
-        summary = await self._generate_compaction_summary(
-            plan.messages_to_summarize,
-            custom_instructions=instructions,
-        )
-        compaction = await self._append_compaction(
-            summary,
-            replace_entry_ids=plan.replace_entry_ids,
-            tokens_before=self.context_token_estimate,
-        )
-        return f"Compacted {len(compaction.replaces_entry_ids)} context entries."
+        result = await self.compact_detailed(instructions)
+        return f"Compacted {result.replaced_entry_count} context entries."
 
     async def aclose(self) -> None:
         """Close every owned extension/provider resource exactly once.
@@ -3032,7 +3412,6 @@ class CodingSession:
         parent_id, suffix, repair = plan
         active_model = self._state.model
         active_thinking_level = self._state.thinking_level
-        active_label = self._state.label
         active_entries = self._state.entries
         parent_index = next(
             (index for index, entry in enumerate(active_entries) if entry.id == parent_id),
@@ -3052,7 +3431,7 @@ class CodingSession:
         ]
         parent_id = staged[-1].id
         for message in suffix:
-            entry = MessageEntry(parent_id=parent_id, message=message)
+            entry = _session_entry_for_message(parent_id=parent_id, message=message)
             staged.append(entry)
             parent_id = entry.id
         if active_model is not None:
@@ -3069,10 +3448,6 @@ class CodingSession:
         )
         staged.append(thinking_entry)
         parent_id = thinking_entry.id
-        if active_label is not None:
-            label_entry = LabelEntry(parent_id=parent_id, label=active_label)
-            staged.append(label_entry)
-            parent_id = label_entry.id
         for custom_entry in custom_entries:
             copied_entry = CustomEntry(
                 parent_id=parent_id,
@@ -3081,8 +3456,6 @@ class CodingSession:
             )
             staged.append(copied_entry)
             parent_id = copied_entry.id
-        staged.append(LeafEntry(parent_id=parent_id, entry_id=parent_id))
-
         if self._config.defer_authoritative_writes:
             self._prepared_entries.extend(staged)
             self._last_parent_id = parent_id
@@ -3118,34 +3491,24 @@ class CodingSession:
     async def _persist_message(self, message: AgentMessage) -> None:
         """Persist one completed message at the active branch tip, idempotently.
 
-        Message lifecycle events are the durable-message boundary. Stable entry
-        ids let a retry finish a partially completed message/leaf pair without
-        appending the message a second time.
-
-        Only a retry reads durable ids: a first attempt mints ids that cannot
-        already be on disk, so the extra full-file read is skipped on the hot
-        path.
+        Message lifecycle events are the durable-message boundary. A stable entry
+        id lets a retry recognize an append that reached disk before raising.
+        Only retries pay for a full-file read.
         """
         message_id = id(message)
         pending = self._pending_message_writes.get(message_id)
         is_retry = pending is not None
         if pending is None:
-            entry = MessageEntry(parent_id=self._last_parent_id, message=message)
-            pending = _PendingMessageWrite(
-                message=message,
-                message_entry=entry,
-                leaf_entry=LeafEntry(parent_id=entry.id, entry_id=entry.id),
-            )
+            entry = _session_entry_for_message(parent_id=self._last_parent_id, message=message)
+            pending = _PendingMessageWrite(message=message, entry=entry)
             self._pending_message_writes[message_id] = pending
 
         durable_ids = (
             {entry.id for entry in await self._read_session_entries()} if is_retry else frozenset()
         )
-        if pending.message_entry.id not in durable_ids:
-            await self._append_session_entry(pending.message_entry)
-        self._last_parent_id = pending.message_entry.id
-        if pending.leaf_entry.id not in durable_ids:
-            await self._append_session_entry(pending.leaf_entry)
+        if pending.entry.id not in durable_ids:
+            await self._append_session_entry(pending.entry)
+        self._last_parent_id = pending.entry.id
 
         await self._refresh_persisted_state(leaf_id=self._last_parent_id)
         self._persisted_message_ids.add(message_id)
@@ -3359,8 +3722,17 @@ class CodingSession:
             plan = self._recent_preserving_compaction_plan()
             if plan is None:
                 return False
-            summary = await self._generate_compaction_summary(plan.messages_to_summarize)
-            await self._append_compaction(summary, replace_entry_ids=plan.replace_entry_ids)
+            tokens_before = self.context_token_estimate
+            generated = await self._generate_compaction_summary(plan.messages_to_summarize)
+            await self._append_compaction(
+                generated.text,
+                first_kept_entry_id=plan.first_kept_entry_id,
+                tokens_before=tokens_before,
+                usage=generated.usage,
+                provider=generated.provider,
+                model=generated.model,
+                response_provider=generated.response_provider,
+            )
             return True
         except Exception as exc:  # noqa: BLE001 - the original overflow remains visible
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
@@ -3457,8 +3829,17 @@ class CodingSession:
         plan = self._recent_preserving_compaction_plan()
         if plan is None:
             return False
-        summary = await self._generate_compaction_summary(plan.messages_to_summarize)
-        await self._append_compaction(summary, replace_entry_ids=plan.replace_entry_ids)
+        tokens_before = self.context_token_estimate
+        generated = await self._generate_compaction_summary(plan.messages_to_summarize)
+        await self._append_compaction(
+            generated.text,
+            first_kept_entry_id=plan.first_kept_entry_id,
+            tokens_before=tokens_before,
+            usage=generated.usage,
+            provider=generated.provider,
+            model=generated.model,
+            response_provider=generated.response_provider,
+        )
         return True
 
     async def _generate_compaction_summary(
@@ -3466,13 +3847,15 @@ class CodingSession:
         messages: tuple[AgentMessage, ...],
         *,
         custom_instructions: str | None = None,
-    ) -> str:
+    ) -> _GeneratedSummary:
         prompt = build_compaction_summary_prompt(
             messages,
             custom_instructions=custom_instructions,
         )
         text_parts: list[str] = []
         final_text: str | None = None
+        response_usages: list[Usage] = []
+        response_provider: str | None = None
         summary_messages: list[AgentMessage] = [UserMessage(content=prompt)]
         async for event in self._harness.config.provider.stream_response(
             model=self.model,
@@ -3484,6 +3867,8 @@ class CodingSession:
                 text_parts.append(event.delta)
             elif isinstance(event, AssistantDoneEvent):
                 final_text = event.message.text
+                response_usages.append(event.message.usage)
+                response_provider = event.message.response_provider
             elif isinstance(event, AssistantErrorEvent):
                 raise RuntimeError(
                     f"Compaction summarization failed: {event.error.error_message or event.reason}"
@@ -3492,7 +3877,13 @@ class CodingSession:
         summary = (final_text if final_text is not None else "".join(text_parts)).strip()
         if not summary:
             raise RuntimeError("Compaction summarization returned an empty summary")
-        return summary
+        return _GeneratedSummary(
+            text=summary,
+            usage=sum_usage(response_usages) if response_usages else None,
+            provider=self.provider_name,
+            model=self.model,
+            response_provider=response_provider,
+        )
 
     async def _summarize_branch_messages(
         self,
@@ -3500,9 +3891,9 @@ class CodingSession:
         *,
         custom_instructions: str | None = None,
         replace_instructions: bool = False,
-    ) -> str:
+    ) -> _GeneratedSummary:
         try:
-            summary = await summarize_branch_messages_with_model(
+            result = await summarize_branch_messages_with_model(
                 provider=self._harness.config.provider,
                 model=self.model,
                 messages=messages,
@@ -3510,16 +3901,19 @@ class CodingSession:
                 replace_instructions=replace_instructions,
             )
         except Exception:
-            summary = None
-        return summary or summarize_messages_for_compaction(messages)
-
-    def _manual_compaction_plan(self) -> CompactionPlan:
-        rows = self._active_context_rows()
-        if not rows:
-            raise ValueError("No active context messages to compact")
-        return CompactionPlan(
-            replace_entry_ids=tuple(entry_id for entry_id, _message in rows),
-            messages_to_summarize=tuple(message for _entry_id, message in rows),
+            result = None
+        if result is not None:
+            summary, usage, response_provider = result
+            return _GeneratedSummary(
+                text=summary,
+                usage=usage,
+                provider=self.provider_name,
+                model=self.model,
+                response_provider=response_provider,
+            )
+        return _GeneratedSummary(
+            text=summarize_messages_for_compaction(messages),
+            usage=None,
         )
 
     def _recent_preserving_compaction_plan(self) -> CompactionPlan | None:
@@ -3534,11 +3928,13 @@ class CodingSession:
         if first_kept_index <= 0:
             return None
 
-        replaced = rows[:first_kept_index]
-        if not replaced:
+        if first_kept_index >= len(rows):
             return None
+
+        replaced = rows[:first_kept_index]
         return CompactionPlan(
-            replace_entry_ids=tuple(entry_id for entry_id, _message in replaced),
+            first_kept_entry_id=rows[first_kept_index][0],
+            replaced_entry_count=len(replaced),
             messages_to_summarize=tuple(message for _entry_id, message in replaced),
         )
 
@@ -3549,23 +3945,27 @@ class CodingSession:
         self,
         summary: str,
         *,
-        replace_entry_ids: tuple[str, ...],
-        first_kept_entry_id: str | None = None,
+        first_kept_entry_id: str,
         tokens_before: int | None = None,
+        usage: Usage | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        response_provider: str | None = None,
     ) -> CompactionEntry:
-        if not replace_entry_ids:
-            raise ValueError("No active context messages to compact")
+        if first_kept_entry_id not in self._state.context_entry_ids:
+            raise ValueError("First kept entry is not in the active context")
 
         compaction = CompactionEntry(
             parent_id=self._last_parent_id,
             summary=summary,
-            replaces_entry_ids=list(replace_entry_ids),
             first_kept_entry_id=first_kept_entry_id,
             tokens_before=tokens_before,
+            usage=usage,
+            provider=provider,
+            model=model,
+            response_provider=response_provider,
         )
         await self._append_session_entry(compaction)
-        leaf = LeafEntry(parent_id=compaction.id, entry_id=compaction.id)
-        await self._append_session_entry(leaf)
         self._last_parent_id = compaction.id
 
         await self._refresh_persisted_state(leaf_id=compaction.id)
@@ -3656,6 +4056,22 @@ def is_retryable_huggingface_route_error(message: AssistantMessage) -> bool:
     return False
 
 
+def _session_entry_for_message(
+    *, parent_id: str | None, message: AgentMessage
+) -> MessageEntry | CustomMessageEntry:
+    """Build the canonical persisted entry for one completed runtime message."""
+    if isinstance(message, CustomMessage):
+        return CustomMessageEntry(
+            parent_id=parent_id,
+            timestamp=message.timestamp / 1000,
+            custom_type=message.custom_type,
+            content=message.content,
+            display=message.display,
+            details=message.details,
+        )
+    return MessageEntry(parent_id=parent_id, message=message)
+
+
 def _detach_missing_parents(entries: list[SessionEntry]) -> list[SessionEntry]:
     """Return entries with dangling parent pointers detached from external history."""
     entry_ids = {entry.id for entry in entries}
@@ -3675,11 +4091,33 @@ def _last_parent_id_from_state(state: SessionState) -> str | None:
     return None
 
 
-def _latest_leaf_entry(entries: list[SessionEntry]) -> LeafEntry | None:
-    for entry in reversed(entries):
-        if isinstance(entry, LeafEntry):
-            return entry
-    return None
+def _active_branchable_entry_id(
+    entries: list[SessionEntry], active_leaf_id: str | None
+) -> str | None:
+    if active_leaf_id is None:
+        return None
+    try:
+        path = path_to_entry(entries, active_leaf_id)
+    except SessionTreeError:
+        return active_leaf_id
+    return next((entry.id for entry in reversed(path) if _is_branchable_tree_entry(entry)), None)
+
+
+def _resolved_labels(entries: list[SessionEntry]) -> tuple[dict[str, str], dict[str, float]]:
+    """Resolve the latest label change for every target in storage order."""
+    labels: dict[str, str] = {}
+    timestamps: dict[str, float] = {}
+    for entry in entries:
+        if not isinstance(entry, LabelEntry):
+            continue
+        label = entry.label.strip() if entry.label is not None else ""
+        if label:
+            labels[entry.target_id] = label
+            timestamps[entry.target_id] = entry.timestamp
+        else:
+            labels.pop(entry.target_id, None)
+            timestamps.pop(entry.target_id, None)
+    return labels, timestamps
 
 
 def _is_branchable_tree_entry(entry: SessionEntry) -> bool:
@@ -3776,6 +4214,8 @@ def _tree_entry_title(entry: SessionEntry) -> str:
                 tool_names = ", ".join(call.name for call in message.tool_calls)
                 return f"tool call: {tool_names}"
             return f"{message.role}: {_message_text_preview(message)}"
+        case "custom_message":
+            return f"custom: {_short_preview(message_text(_custom_message_from_entry(entry)))}"
         case "compaction":
             return f"compaction summary: {_short_preview(entry.summary)}"
         case "branch_summary":
@@ -3812,8 +4252,22 @@ def _messages_after_entry_on_active_path(
         )
     except StopIteration:
         return ()
-    return tuple(
-        entry.message for entry in active_path[target_index + 1 :] if entry.type == "message"
+    messages: list[AgentMessage] = []
+    for entry in active_path[target_index + 1 :]:
+        if entry.type == "message":
+            messages.append(entry.message)
+        elif entry.type == "custom_message":
+            messages.append(_custom_message_from_entry(entry))
+    return tuple(messages)
+
+
+def _custom_message_from_entry(entry: CustomMessageEntry) -> CustomMessage:
+    return CustomMessage(
+        custom_type=entry.custom_type,
+        content=entry.content,
+        display=entry.display,
+        details=entry.details,
+        timestamp=round(entry.timestamp * 1000),
     )
 
 
@@ -3870,6 +4324,7 @@ class _PreparedProvider:
     inference_provider_mode: InferenceProviderMode
     runtime_provider_config: ProviderConfig | None
     dynamic_provider: DynamicProvider | None
+    runtime_model_catalog: RuntimeModelCatalog | None = None
 
 
 async def _prepare_provider_selection(
@@ -3941,15 +4396,50 @@ async def _prepare_provider_selection(
             )
 
     settings = config.provider_settings
+    discovered_catalog: RuntimeModelCatalog | None = None
     if settings is None:
         raise ProviderConfigError(
             f"Provider is not available after trusted extension loading: "
             f"{provider_name or config.model}"
         )
+    selected_model = requested_model or (state.model if state.provider == provider_name else None)
+    selected_provider = settings.get_provider(provider_name or settings.default_provider)
+    if (
+        isinstance(selected_provider, OpenAICodexProviderConfig)
+        and selected_model is not None
+        and selected_model not in selected_provider.models
+        and environ.get("TAU_OFFLINE") is None
+    ):
+        # Live-only explicit/resumed models need discovery before static validation.
+        discovery_provider = None
+        try:
+            discovery_provider = create_model_provider(
+                selected_provider,
+                credential_store=credential_store,
+                model=None,
+                thinking_level=None,
+            )
+            if isinstance(discovery_provider, ModelCatalogProvider):
+                catalog = await discovery_provider.discover_models()
+                if catalog.models:
+                    discovered_catalog = catalog
+                    live_provider = _provider_with_runtime_model_catalog(selected_provider, catalog)
+                    settings = replace(
+                        settings,
+                        providers=tuple(
+                            live_provider if item.name == selected_provider.name else item
+                            for item in settings.providers
+                        ),
+                    )
+        except Exception:  # noqa: BLE001 - retain ordinary static validation on failure
+            pass
+        finally:
+            if discovery_provider is not None:
+                await discovery_provider.aclose()
     selection = resolve_provider_selection(
         settings,
         provider_name=provider_name,
-        model=(requested_model or (state.model if state.provider == provider_name else None)),
+        model=selected_model,
     )
     inference_provider = _session_inference_provider(
         config,
@@ -3985,6 +4475,7 @@ async def _prepare_provider_selection(
         inference_provider_mode=inference_provider_mode,
         runtime_provider_config=selection.provider,
         dynamic_provider=None,
+        runtime_model_catalog=discovered_catalog,
     )
 
 
@@ -4074,6 +4565,16 @@ def _initial_thinking_level_for_config(
     model: str,
 ) -> ThinkingLevel:
     provider = _provider_config_for_name(config, config.provider_name)
+    if config.thinking_level_override is not None:
+        if provider is None:
+            return config.thinking_level_override
+        resolved = resolve_startup_thinking_level(
+            provider,
+            model,
+            cli_override=config.thinking_level_override,
+        )
+        if resolved is not None:
+            return resolved
     if provider is None:
         return config.thinking_level
     return _preferred_thinking_level_for_model(
@@ -4087,6 +4588,11 @@ def _provider_config_for_name(
     config: CodingSessionConfig,
     provider_name: str,
 ) -> ProviderConfig | None:
+    if (
+        isinstance(config.runtime_provider_config, OpenAICodexProviderConfig)
+        and config.runtime_provider_config.name == provider_name
+    ):
+        return config.runtime_provider_config
     if config.provider_settings is not None:
         try:
             return config.provider_settings.get_provider(provider_name)
@@ -4328,6 +4834,113 @@ def _system_prompt_resource_signatures(
     )
 
 
+def _provider_config_or_none(
+    settings: ProviderSettings | None,
+    provider_name: str | None,
+) -> ProviderConfig | None:
+    if settings is None or provider_name is None:
+        return None
+    try:
+        return settings.get_provider(provider_name)
+    except ProviderConfigError:
+        return None
+
+
+def _codex_account_id(
+    provider: OpenAICodexProviderConfig,
+    credential_store: FileCredentialStore,
+) -> str | None:
+    if provider.credential_name:
+        credential = credential_store.get_oauth(provider.credential_name)
+        if credential is not None and credential.account_id:
+            return credential.account_id
+    return account_id_from_access_token(environ.get(provider.api_key_env, ""))
+
+
+def _provider_settings_with_runtime_catalogs(
+    settings: ProviderSettings | None,
+    catalogs: Mapping[str, RuntimeModelCatalog],
+) -> ProviderSettings | None:
+    if settings is None or not catalogs:
+        return settings
+    providers = tuple(
+        _provider_with_runtime_model_catalog(provider, catalogs.get(provider.name))
+        for provider in settings.providers
+    )
+    return replace(settings, providers=providers)
+
+
+def _provider_with_runtime_model_catalog(
+    provider: ProviderConfig,
+    catalog: RuntimeModelCatalog | None,
+) -> ProviderConfig:
+    """Overlay one account-specific catalog without changing durable settings."""
+    if catalog is None or not isinstance(provider, OpenAICodexProviderConfig):
+        return provider
+
+    models = tuple(model.id for model in catalog.models)
+    metadata = {
+        model.id: _runtime_provider_model_metadata(provider, model) for model in catalog.models
+    }
+    context_windows = {
+        model.id: (
+            model.limits.context_window
+            if model.limits is not None
+            else provider.context_windows[model.id]
+        )
+        for model in catalog.models
+        if model.limits is not None or model.id in provider.context_windows
+    }
+    return replace(
+        provider,
+        models=models,
+        default_model=(provider.default_model if provider.default_model in models else models[0]),
+        context_windows=context_windows,
+        model_metadata=metadata,
+        thinking_models=tuple(model.id for model in catalog.models if model.thinking_levels),
+        thinking_defaults=_runtime_model_thinking_defaults(provider, catalog),
+    )
+
+
+def _runtime_model_thinking_defaults(
+    provider: OpenAICodexProviderConfig,
+    catalog: RuntimeModelCatalog,
+) -> dict[str, ThinkingLevel]:
+    defaults: dict[str, ThinkingLevel] = {}
+    for model in catalog.models:
+        default = provider.thinking_defaults.get(model.id) or model.default_thinking_level
+        if default is not None:
+            defaults[model.id] = default
+    return defaults
+
+
+def _runtime_provider_model_metadata(
+    provider: OpenAICodexProviderConfig,
+    model: RuntimeModel,
+) -> ProviderModelMetadata:
+    existing = provider.model_metadata.get(model.id, ProviderModelMetadata())
+    supported = set(model.thinking_levels)
+    thinking_level_map = {
+        level: ("none" if level == "off" else level) if level in supported else None
+        for level in THINKING_LEVELS
+    }
+    return replace(
+        existing,
+        name=model.name or existing.name,
+        reasoning=True if model.thinking_levels else existing.reasoning,
+        input=model.input_modalities,
+        context_window=(
+            model.limits.context_window if model.limits is not None else existing.context_window
+        ),
+        max_tokens=(
+            model.limits.max_output_tokens
+            if model.limits is not None and model.limits.max_output_tokens is not None
+            else existing.max_tokens
+        ),
+        thinking_level_map=thinking_level_map,
+    )
+
+
 def _load_session_resources(
     resource_paths: TauResourcePaths,
     explicit_context_files: tuple[ProjectContextFile, ...],
@@ -4360,6 +4973,7 @@ def _load_session_resources(
         custom_system_prompt=system_prompts.custom_prompt,
         custom_system_prompt_path=system_prompts.custom_prompt_path,
         append_system_prompt=system_prompts.append_prompt,
+        append_system_prompts=system_prompts.append_prompts,
         append_system_prompt_paths=system_prompts.append_prompt_paths,
         diagnostics=tuple(
             [
@@ -4372,12 +4986,31 @@ def _load_session_resources(
     )
 
 
-def _compose_append_system_prompt(*parts: str | None) -> str | None:
-    """Compose discovered and explicit append content in source order."""
-    selected = [part for part in parts if part is not None]
-    if not selected:
-        return None
-    return "\n\n".join(selected)
+def _append_prompt_sections(
+    prompts: tuple[str, ...],
+    paths: tuple[Path, ...],
+    explicit_prompt: str | None,
+) -> tuple[PromptSection, ...]:
+    """Pair append content with its file or CLI origin in composition order."""
+    sections = [
+        PromptSection(title=None, body=prompt, source=str(path))
+        for prompt, path in zip(prompts, paths, strict=True)
+    ]
+    if explicit_prompt is not None:
+        sections.append(
+            PromptSection(
+                title=None,
+                body=explicit_prompt,
+                source="CLI --append-system-prompt",
+            )
+        )
+    return tuple(sections)
+
+
+def _custom_prompt_source(*, explicit: bool, path: Path | None) -> str:
+    if explicit:
+        return "CLI --system-prompt"
+    return str(path) if path is not None else "runtime configuration"
 
 
 def _merge_context_files(

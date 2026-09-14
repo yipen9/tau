@@ -140,6 +140,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
         "resume",
         "scoped-models",
         "session",
+        "sidebar",
         "skill",
         "skills",
         "system",
@@ -157,6 +158,17 @@ def test_local_command_requests_host_action(tmp_path: Path) -> None:
     assert registry.execute(session, "/local extra").message == "Usage: /local"
 
 
+def test_sidebar_command_requests_host_action(tmp_path: Path) -> None:
+    registry = create_default_command_registry()
+    session = FakeSession(tmp_path)
+
+    result = registry.execute(session, "/sidebar")
+
+    assert result.handled is True
+    assert result.sidebar_toggle_requested is True
+    assert registry.execute(session, "/sidebar extra").message == "Usage: /sidebar"
+
+
 def test_prompts_command_requests_picker(tmp_path: Path) -> None:
     registry = create_default_command_registry()
     session = FakeSession(tmp_path)
@@ -172,7 +184,11 @@ def test_system_command_returns_active_prompt(tmp_path: Path) -> None:
     result = registry.execute(session, "/system")
 
     assert result.handled is True
-    assert result.message == "You are Tau.\nFollow project instructions."
+    assert result.message == (
+        "#### 01 · Effective system prompt\n\n"
+        "**Source:** `active Tau session`\n\n"
+        "You are Tau.\nFollow project instructions."
+    )
     assert registry.execute(session, "/system extra").message == "Usage: /system"
 
 
@@ -316,6 +332,7 @@ def test_hotkeys_command_lists_common_tui_shortcuts(tmp_path: Path) -> None:
     assert "Common keyboard shortcuts:" in result.message
     assert "Ctrl+K: open slash-command completions" in result.message
     assert "Ctrl+R: open session picker" in result.message
+    assert "Ctrl+P / Shift+Ctrl+P: cycle scoped models forward / backward" in result.message
     assert "Shift+Tab: cycle thinking mode" in result.message
 
 
