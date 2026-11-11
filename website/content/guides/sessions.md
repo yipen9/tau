@@ -30,13 +30,21 @@ From inside the TUI:
 /resume <id>       # resume a specific session
 ```
 
-The `/resume` picker separates projects and recent sessions into two columns.
-The project column uses compact folder names; the selected project's full path
-appears above the session column. Its shell opens immediately, then the current
-project and other project indexes load in the background. Press
+The `/resume` picker presents projects and recent sessions as contiguous
+Finder-style columns in one browser. The project column uses compact folder
+names without session counts; the selected project's full path appears above
+the session column. Its shell opens immediately, then the current project and
+other project indexes load in the background. Press
 **Left** to move to the project column, use **Up/Down** to choose another
 project, then press **Right** to return to its sessions. Press **Enter** (or
-click) to resume one.
+click) to resume one. Press **Ctrl+Enter** to archive the highlighted session.
+When the project column is active, **Ctrl+Enter** archives that whole project.
+Choose
+the **Archived** tab above the picker to review archived projects and sessions.
+Press **F2** anywhere in the picker to open that tab; press **Enter** on an
+archived session to restore it, or on an archived project
+to restore all of its sessions. Restored items return to the **Active** tab.
+Archiving never deletes session files or project directories.
 
 The search field filters session names and models within the selected project.
 
@@ -55,7 +63,10 @@ To resume this session: tau --session <session-id>
 A session is a *tree*, not just a line — so you can go back and try a different
 path without losing what you had.
 
-Run `/tree` to open the session tree, then select an earlier entry:
+Run `/tree` to open the session tree, then select an earlier entry. At each
+fork, the child with the longest history is shown as the main branch. Alternate
+branches appear immediately after the parent, indented at the branch point,
+before the unindented main history continues.
 
 - **Enter** — continue from that point, preserving the existing branch.
 - **S** — ask the active model for a structured summary of the messages you're
@@ -96,9 +107,10 @@ not append another repair when history is already valid.
 
 New sessions are automatically given a short name from the first message when
 Tau can generate one. Tau shows the confirmed message first—including the
-expanded text from a prompt-template slash command—then performs naming without
-holding up that transcript update. The name appears anywhere session names are
-already shown, including the `/resume` picker and id completions.
+expanded text from a prompt-template slash command—then sends the naming request
+alongside the agent's reply, so naming delays neither the transcript nor the
+response. The name appears anywhere session names are already shown, including
+the `/resume` picker and id completions.
 
 Auto-naming makes one high-level provider request. The provider adapter may retry
 transient failures according to its configured `max_retries`. If those attempts
@@ -195,7 +207,7 @@ context.
 
 Tau's persisted entry wrappers use snake_case names such as `parent_id` and
 `custom_type`. The Pi-compatible RPC inspection API projects those fields as
-`parentId` and `customType`; see the [RPC reference]({{< relref "../reference/rpc.md" >}}).
+`parentId` and `customType`; see the [RPC reference](/reference/rpc/).
 
 ## Where sessions live
 
@@ -225,4 +237,4 @@ the field-wise total. Older entries and heuristic branch-summary fallbacks omit
 usage analytics.
 
 See
-[Configuration]({{< relref "../reference/configuration.md#sessions" >}}) for the exact layout.
+[Configuration](/reference/configuration/#sessions) for the exact layout.

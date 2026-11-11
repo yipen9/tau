@@ -7,6 +7,12 @@ rendering.
 
 For Hugging Face-specific routing extensions, `set_inference_provider(<provider>)` selects a fixed route while `set_inference_provider(None)` restores recoverable automatic routing. Read both `context.inference_provider` (current route) and `context.inference_provider_mode` (`automatic` or `fixed`) when presenting route status.
 
+Once a session is bound, `context.available_providers` returns the provider IDs
+Tau can currently call, and `context.available_model_choices` returns frozen
+`ModelChoice(provider_name, model)` values from the effective runtime
+inventory. This includes dynamic providers and runtime-refreshed model catalogs;
+providers without usable credentials are omitted.
+
 Once a session is bound, `await tau.set_label(entry_id, label)` creates or updates
 a per-entry bookmark. Pass `None` or an empty string to clear it. The target must
 be an existing session entry; Tau validates it and appends the change rather
@@ -19,7 +25,7 @@ For complete API documentation, read the repository's published guide when worki
 - `website/content/guides/extensions.md`
 - `dev-notes/architecture/phase-21-extensions.md`
 
-Installed examples are under `examples/extensions/` next to these docs. Read the relevant example completely before implementing an extension.
+Installed examples are under `examples/extensions/` next to these docs. Read the relevant example completely before implementing an extension. `ask_user_question.py` demonstrates an agent tool that waits for a multiple-choice UI selection.
 
 ## Locations
 
@@ -103,6 +109,25 @@ fresh-generation replacement flows), a context captured from the outgoing
 generation is stale: even reading `context.paths` raises `ExtensionError`. Read
 `context.paths` again from the new generation's context.
 
+## Building child sessions
+
+An extension may construct its own in-process `CodingSession`s (for example a
+subagent tool) via `CodingSession.load(CodingSessionConfig(...))`. Two seams
+exist for that:
+
+- `tau.context.project_trusted` (bool) and `tau.context.project_trust_resolution`
+  (the frozen `ProjectTrustResolution`, or `None`) expose the parent's
+  project-input trust decision. A headless child resolves trust on its own and
+  lands untrusted under the default config, silently losing project skills,
+  `AGENTS.md`, and project extensions. Forward the parent's decision through
+  `CodingSessionConfig.trust_override`: `"approve"` when `project_trusted` is
+  true, `"decline"` otherwise. Never approve unconditionally.
+- `CodingSessionConfig.allowed_tool_names` (`frozenset[str] | None`) caps the
+  child's *final* tool list by name after extension tools are composed on top
+  of the built-ins, and is re-applied on every reload. `tools=` alone cannot do
+  this because extension tools are always appended afterwards. Unknown names
+  are ignored; `None` disables filtering.
+
 ## Dynamic providers
 
 `tau.register_provider(DynamicProvider(...))` adds a frontend-free provider layer
@@ -178,6 +203,26 @@ possible but use, reset, and model-management actions are unavailable. Retiring
 or reloading a generation cancels its backend operations and discards late
 results. The built-in `/local` command opens the generic TUI host; print mode
 reports that the command is interactive-only.
+
+## Final submissions
+
+A custom tool may return `AgentToolResult(..., details=structured_result,
+terminate=True)` after successfully accepting a final submission. As in Pi, this
+skips the automatic follow-up model call only when every final result in the
+nonempty batch explicitly terminates. All sibling tools finish; mixed batches
+continue. Queued steering/follow-ups still receive responses. Progress flags do
+not count; final post-hook results do. `terminate` is runtime-only metadata, not
+part of the transcript's `ToolResultMessage`, and is not cancellation.
+
+There is no special built-in terminate tool. See the complete
+`examples/extensions/structured_output.py` example and
+`website/content/guides/extensions.md`. Invalid submissions raise a tool error
+rather than terminate. The example retains validated data in result `details`
+and writes no external file.
+
+Hosts needing a strict stop before queue polling can configure the portable
+harness's `finish_turn` callback instead; see `architecture.md` and
+`website/content/internals/agent-loop.md`. This is not an extension hook.
 
 ## Development checklist
 

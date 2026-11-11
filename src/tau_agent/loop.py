@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from inspect import isawaitable
 from time import monotonic_ns
 
 from tau_agent.events import (
@@ -41,6 +42,7 @@ from tau_agent.provider_events import (
 )
 from tau_agent.tool_history import repair_tool_history
 from tau_agent.tools import AgentTool, AgentToolResult
+from tau_agent.turns import AgentTurnContext, AgentTurnDecision, FinishTurn
 
 BeforeToolCall = Callable[[ToolCall], Awaitable[tuple[bool, str | None]]]
 AfterToolCall = Callable[
@@ -65,6 +67,7 @@ async def run_agent_loop(
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     before_tool_call: BeforeToolCall | None = None,
     after_tool_call: AfterToolCall | None = None,
+    finish_turn: FinishTurn | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run the provider/tool loop and emit Pi-compatible agent events."""
     new_messages = list(prompts)
@@ -86,6 +89,7 @@ async def run_agent_loop(
         new_messages.append(error)
         yield MessageStartEvent(message=error)
         yield MessageEndEvent(message=error)
+        await _finish_turn(finish_turn, error, (), messages, new_messages, signal)
         yield TurnEndEvent(message=error)
         yield AgentEndEvent(messages=new_messages)
         return
@@ -94,6 +98,9 @@ async def run_agent_loop(
     turn = 1
     first_turn = True
     pending = tuple(get_steering_messages() if get_steering_messages else ())
+    # Error text of the tool call that cancelled the run, e.g. a hook's reason.
+    stop_note: str | None = None
+    explicit_continuation = False
 
     while True:
         has_more_tools = True
@@ -115,7 +122,20 @@ async def run_agent_loop(
                 new_messages.append(error)
                 yield MessageStartEvent(message=error)
                 yield MessageEndEvent(message=error)
+                await _finish_turn(finish_turn, error, (), messages, new_messages, signal)
                 yield TurnEndEvent(message=error)
+                yield AgentEndEvent(messages=new_messages)
+                return
+
+            if signal is not None and signal.is_cancelled():
+                # A request started after a cancel would fail as a provider error.
+                aborted = _aborted_message(model, stop_note)
+                messages.append(aborted)
+                new_messages.append(aborted)
+                yield MessageStartEvent(message=aborted)
+                yield MessageEndEvent(message=aborted)
+                await _finish_turn(finish_turn, aborted, (), messages, new_messages, signal)
+                yield TurnEndEvent(message=aborted)
                 yield AgentEndEvent(messages=new_messages)
                 return
 
@@ -146,14 +166,16 @@ async def run_agent_loop(
             messages.append(assistant)
             new_messages.append(assistant)
             if assistant.stop_reason in {"error", "aborted"}:
+                await _finish_turn(finish_turn, assistant, (), messages, new_messages, signal)
                 yield TurnEndEvent(message=assistant)
                 yield AgentEndEvent(messages=new_messages)
                 return
 
             tool_results: list[ToolResultMessage] = []
             calls = list(assistant.tool_calls)
-            has_more_tools = bool(calls)
+            all_tools_terminate = True
             for call in calls:
+                cancelled_before = signal is not None and signal.is_cancelled()
                 async for event in _execute_tool_call(
                     call,
                     tool_by_name,
@@ -161,6 +183,8 @@ async def run_agent_loop(
                     before_tool_call,
                     after_tool_call,
                 ):
+                    if isinstance(event, ToolExecutionEndEvent):
+                        all_tools_terminate = all_tools_terminate and event.result.terminate is True
                     yield event
                     if isinstance(event, MessageEndEvent) and isinstance(
                         event.message, ToolResultMessage
@@ -168,18 +192,67 @@ async def run_agent_loop(
                         tool_results.append(event.message)
                         messages.append(event.message)
                         new_messages.append(event.message)
+                        if (
+                            stop_note is None
+                            and not cancelled_before
+                            and signal is not None
+                            and signal.is_cancelled()
+                            and event.message.is_error
+                        ):
+                            stop_note = event.message.text or None
 
+            # Termination is a batch scheduling hint, not an interruption of
+            # sibling tools or cancellation. Only final, post-hook results count.
+            has_more_tools = bool(calls) and (
+                not all_tools_terminate or (signal is not None and signal.is_cancelled())
+            )
+            decision = await _finish_turn(
+                finish_turn, assistant, tool_results, messages, new_messages, signal
+            )
             yield TurnEndEvent(message=assistant, tool_results=tool_results)
+            if decision is not None and decision.action == "end":
+                yield AgentEndEvent(messages=new_messages)
+                return
+
             turn += 1
+            explicit_continuation = decision is not None and decision.action == "continue"
             pending = tuple(get_steering_messages() if get_steering_messages else ())
+            if has_more_tools or pending:
+                explicit_continuation = False
 
         follow_ups = tuple(get_follow_up_messages() if get_follow_up_messages else ())
         if follow_ups:
             pending = follow_ups
+            explicit_continuation = False
+            continue
+        if explicit_continuation:
+            explicit_continuation = False
             continue
         break
 
     yield AgentEndEvent(messages=new_messages)
+
+
+async def _finish_turn(
+    callback: FinishTurn | None,
+    message: AssistantMessage,
+    tool_results: Sequence[ToolResultMessage],
+    messages: Sequence[AgentMessage],
+    new_messages: Sequence[AgentMessage],
+    signal: CancellationToken | None,
+) -> AgentTurnDecision | None:
+    if callback is None:
+        return None
+    decision = callback(
+        AgentTurnContext(
+            message=message,
+            tool_results=tuple(tool_results),
+            messages=tuple(messages),
+            new_messages=tuple(new_messages),
+        ),
+        signal,
+    )
+    return await decision if isawaitable(decision) else decision
 
 
 def _provider_context(messages: list[AgentMessage]) -> list[AgentMessage]:
@@ -373,4 +446,13 @@ def _error_message(model: str, message: str) -> AssistantMessage:
         content=[],
         stop_reason="error",
         error_message=message,
+    )
+
+
+def _aborted_message(model: str, reason: str | None) -> AssistantMessage:
+    return AssistantMessage(
+        model=model,
+        content=[],
+        stop_reason="aborted",
+        error_message=reason or "Operation aborted",
     )

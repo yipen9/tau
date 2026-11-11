@@ -545,6 +545,60 @@ def test_cli_without_prompt_invokes_tui_runner(
     assert calls == [(None, tmp_path, None, False, None, None, None)]
 
 
+def test_tui_startup_does_not_wait_for_pypi_update_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    notices: list[object] = []
+
+    async def fake_run_openai_tui(*args: object, **kwargs: object) -> None:
+        del kwargs
+        notices.append(args[7])
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_startup_update_notice",
+        lambda: (_ for _ in ()).throw(AssertionError("no blocking update check")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "cached_update_notice",
+        lambda version: (UpdateNotice(current_version=version, latest_version="9.9.9"), False),
+    )
+    monkeypatch.setattr(cli, "run_openai_tui", fake_run_openai_tui)
+
+    result = CliRunner().invoke(app, [])
+
+    assert result.exit_code == 0
+    assert [getattr(notice, "latest_version", None) for notice in notices] == ["9.9.9"]
+
+
+@pytest.mark.anyio
+async def test_run_openai_tui_defers_due_update_check_to_the_app(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    deferred_checks: list[object] = []
+
+    async def fake_run_tui_app(**kwargs: object) -> None:
+        deferred_checks.append(kwargs["deferred_startup_update_notice"])
+
+    monkeypatch.setattr(cli, "run_tui_app", fake_run_tui_app)
+    monkeypatch.setattr(cli, "startup_release_notes_notice", lambda version: None)
+    monkeypatch.setattr(cli, "_current_version", lambda: "0.1.0")
+    monkeypatch.setattr(cli, "cached_update_notice", lambda version: (None, True))
+    monkeypatch.setattr(
+        cli,
+        "_startup_update_notice",
+        lambda: UpdateNotice(current_version="0.1.0", latest_version="0.2.0"),
+    )
+
+    await cli.run_openai_tui(model=None, cwd=tmp_path)
+
+    [check] = deferred_checks
+    assert callable(check)
+    assert check() == UpdateNotice(current_version="0.1.0", latest_version="0.2.0").message
+
+
 def test_cli_prints_resume_hint_after_tui_exit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1935,6 +1989,61 @@ def test_setup_command_writes_provider_settings(
     assert provider.timeout_seconds == 120
     assert provider.max_retries == 2
     assert provider.max_retry_delay_seconds == 0.5
+
+
+def test_relative_tau_home_reports_actionable_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TAU_HOME", ".tau-personal")
+
+    result = CliRunner().invoke(app, ["providers"])
+
+    assert result.exit_code == 2
+    assert "Invalid value for TAU_HOME" in result.stderr
+    assert "must be an absolute path" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_unknown_user_tau_home_reports_actionable_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TAU_HOME", "~tau-review-user-that-does-not-exist-728/.tau")
+
+    result = CliRunner().invoke(app, ["providers"])
+
+    assert result.exit_code == 2
+    assert "Invalid value for TAU_HOME" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_setup_command_writes_only_to_configured_tau_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    tau_home = tmp_path / ".tau-personal"
+    monkeypatch.setenv("TAU_HOME", str(tau_home))
+    monkeypatch.setenv("LOCAL_API_KEY", "test-key")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--provider",
+            "local",
+            "--base-url",
+            "http://localhost:11434/v1",
+            "--api-key-env",
+            "LOCAL_API_KEY",
+            "--model",
+            "qwen",
+            "setup",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (tau_home / "catalog.toml").exists()
+    assert (tau_home / "providers.json").exists()
+    assert not (tmp_path / ".tau").exists()
+    assert load_provider_settings(TauPaths(home=tau_home)).default_provider == "local"
 
 
 def test_setup_command_warns_when_api_key_env_is_missing(
